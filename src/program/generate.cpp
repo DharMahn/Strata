@@ -28,6 +28,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -101,6 +102,14 @@ bool refill_blocking() {
 }
 
 using Clock = std::chrono::steady_clock;
+
+// A thread working beside the decode loop (the adaptive tier's refills) holds this around each copy: on HIP no graph
+// capture may run meanwhile (hip_compat/cuda_runtime.h, capture_mutex); CUDA's thread-local captures need nothing.
+struct CaptureExclusion {
+#if defined(STRATA_USE_HIP)
+    std::lock_guard<std::mutex> lk{strata::hip_compat::capture_mutex()};
+#endif
+};
 
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
@@ -955,6 +964,19 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     }
+#if defined(STRATA_USE_HIP)
+    {
+        // Choose the card before any GPU work (see select_primary_gpu): a PC whose device 0 is a CPU's integrated
+        // Radeon runs the engine on its discrete card.
+        bool help = false;
+        for (int i = 1; i < argc; ++i) help = help || std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h";
+        std::string gpu_err;
+        if (!help && strata::core::select_primary_gpu(gpu_err) < 0) {
+            std::fprintf(stderr, "strata generate: %s\n", gpu_err.c_str());
+            return 1;
+        }
+    }
+#endif
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -1298,7 +1320,7 @@ int main(int argc, char** argv) {
     {
         // every GPU this run uses must be an architecture the binary has code for (a gfx1100 build on a gfx1201
         // card would otherwise fail later with "invalid device function")
-        std::vector<int> used{0};
+        std::vector<int> used{strata::core::primary_gpu()};
         if (multi_gpu) used.insert(used.end(), split_devs.begin(), split_devs.end());
         for (int r = 0; r < 3; ++r)
             if (o.expert_cache_remote[(size_t) r] > 0) used.push_back(remote_dev[r]);
@@ -2278,7 +2300,18 @@ int main(int argc, char** argv) {
         // Unregistered layers remain in the resident arena and use the CPU expert path.
         // (a layer split across GPUs too: pinning all of it into two contexts leaves WDDM refusing every later
         // allocation - measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail)
-        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
+        uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
+        // STRATA_PIN_LIMIT_GIB=<n>: pin at most n GiB of the arena (0: all of it).  On Windows HIP, pinning the
+        // whole arena (35 GB of it) leaves PAL unable to finalize the next command buffers ("unspecified launch
+        // failure" at the first copy), as WDDM refused later allocations in the multi-GPU case above.
+        if (const char* v = std::getenv("STRATA_PIN_LIMIT_GIB"); v != nullptr && v[0] != '\0')
+            pin_limit = (uint64_t) (std::atof(v) * 1073741824.0);
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+#ifndef STRATA_HIP_WIN_PIN_LIMIT_GIB
+#define STRATA_HIP_WIN_PIN_LIMIT_GIB 8
+#endif
+        else if (pin_limit == 0) pin_limit = (uint64_t) STRATA_HIP_WIN_PIN_LIMIT_GIB * (1ull << 30);
+#endif
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -2354,6 +2387,23 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+        {   // the free figure above is already capped by this (hip_compat cudaMemGetInfo); shown so the log says why
+            cudaDeviceProp p{};
+            unsigned long long budget = 0, usage = 0;
+            if (cudaGetDeviceProperties(&p, strata::core::primary_gpu()) == cudaSuccess &&
+                strata::platform::wddm_local_memory(p.luid, &budget, &usage)) {
+                unsigned long long others = 0;
+                const bool known = strata::platform::wddm_others_local_usage(p.luid, &others);
+                char held[32] = "?";
+                if (known) std::snprintf(held, sizeof held, "%.2f", (double) others / 1073741824.0);
+                std::fprintf(stderr, "strata generate: WDDM local budget %.2f GiB, this process uses %.2f GiB, other "
+                                     "programs hold %s GiB of VRAM (the free figure is capped by both)\n",
+                             (double) budget / 1073741824.0, (double) usage / 1073741824.0, held);
+            }
+            cudaGetLastError();
+        }
+#endif
         if (o.expert_cache == 0)   // the verify window cannot start without it (#174): say what makes room
             std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache: lower --max-context, use "
                                  "--kv k8v4, run images on the CPU, or close other programs that use the GPU\n");
@@ -3878,6 +3928,10 @@ int main(int argc, char** argv) {
         }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        if (ver.device_plan_all() && drive.d.pcie_num > 0) {   // the device's plan has no PCIe groups
+            std::fprintf(stderr, "strata serve: STRATA_VERIFY_DEVICE_PLAN=2 needs --pcie-frac 0: using 0\n");
+            drive.d.pcie_num = 0;
+        }
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         cudaStream_t adapt_stream = nullptr;
         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
@@ -3888,6 +3942,28 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        // The adaptive tier's thread lives across windows.  It publishes its evictions first (the host and device
+        // residency tables: the next window computes those experts on the CPU), then issues the refill copies - most
+        // from the unpinned arena, which HIP stages through the calling thread: ~12 ms for 96 swaps, which the decode
+        // loop used to wait for after every 4th draft (~3 ms a window).  The loop now waits only for the publication;
+        // a refilled expert is admitted by apply_pending once the thread is done and its copy has landed.
+        // OPT-IN (STRATA_ADAPT_BG=1) until it is understood: in 1 of ~28 bench starts with it (2026-10-02) the 8K prompt
+        // came out NaN (degenerate routing, "!!!..."), never in ~60 without; and before the capture lock below it also
+        // broke a graph capture.  Default: the whole thread is joined after the draft, as before.
+        std::thread adapt_bg;
+        std::atomic<bool> adapt_published{true}, adapt_issued{true}, adapt_ok_bg{true};
+        // debug (STRATA_DBG_SLOTS=1, the "!!!" hunt): the last writer of each CUDA0 slot - 'a' an adaptive swap,
+        // 'r' a refill after a prompt, 0 the startup fill - with the request and the window it was issued in
+        struct SlotNote { char kind = 0; int32_t req = -1; int64_t win = -1; int32_t pair = -1; };
+        static const bool dbg_slots_on = std::getenv("STRATA_DBG_SLOTS") != nullptr;
+        std::vector<SlotNote> dbg_slot_note(dbg_slots_on ? (size_t) xcache.slots() : 0);
+        int32_t dbg_req = 0;
+        std::atomic<int64_t> dbg_win{0};
+        static const bool adapt_join_all = [] { const char* v = std::getenv("STRATA_ADAPT_BG"); return !(v && v[0] == '1'); }();
+        struct AdaptJoin {
+            std::thread* t;
+            ~AdaptJoin() { if (t->joinable()) t->join(); }
+        } adapt_join_guard{&adapt_bg};
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
             if (d_res != nullptr)
@@ -3898,7 +3974,11 @@ int main(int argc, char** argv) {
             }
         };
         auto apply_pending = [&](bool wait) {
-            if (pending.empty()) return;
+            if (adapt_bg.joinable()) {
+                if (!wait && !adapt_issued.load(std::memory_order_acquire)) return;   // still issuing its copies
+                adapt_bg.join();
+            }
+            if (pending.empty() || !adapt_ok_bg.load()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
@@ -3940,32 +4020,45 @@ int main(int argc, char** argv) {
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
-            bool main_live = false;
+            struct Copy { void* dst; const uint8_t* src; size_t bytes; GpuStage* gs; };
+            std::vector<Copy> copies;
+            copies.reserve(swaps.size());
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
-                const strata::core::OnDevice on(gs ? gs->dev : -1);
-                if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess)
-                    return false;
-                if (gs) gs->adapt_live = true;
-                else main_live = true;
+                if (slot < 0 || b == nullptr) return false;
+                if (dbg_slots_on && gs == nullptr) dbg_slot_note[(size_t) slot] = {'a', dbg_req, dbg_win.load(), (int32_t) in};
+                copies.push_back({gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                                  (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), gs});
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
+            for (float& v : drive.d.usage) v *= 0.7f;
+            // the device's own plan (STRATA_VERIFY_DEVICE_PLAN=2) reads the device table: it must stop naming the
+            // evicted experts before the next window, or the GPU would read a slot that is being overwritten
+            if (ver.device_plan_all() && !swaps.empty()) {
+                const CaptureExclusion cx;   // the loop may be capturing a graph meanwhile (the commit, the drafts)
+                res_upload();
+            }
+            adapt_published.store(true, std::memory_order_release);   // the next window may start
+            for (const Copy& c : copies) {
+                const CaptureExclusion cx;   // one copy at a time: a capture waits for at most one
+                const strata::core::OnDevice on(c.gs ? c.gs->dev : -1);
+                if (cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyHostToDevice,
+                                    c.gs ? c.gs->adapt_stream : adapt_stream) != cudaSuccess)
+                    return false;
+                if (c.gs) c.gs->adapt_live = true;
+            }
+            const CaptureExclusion cx;
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
-            (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
                     const strata::core::OnDevice on(st->dev);
                     cudaEventRecord(st->adapt_ev, st->adapt_stream);
                 }
-            for (float& v : drive.d.usage) v *= 0.7f;
             return true;
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
@@ -4047,6 +4140,50 @@ int main(int argc, char** argv) {
                              (long long) free_mib, (long long) (o.vram_reserve_mib + 512 - free_mib));
             }
         }
+        if (std::getenv("STRATA_VRAM_PROBE") != nullptr) {
+            // where the big allocations really live (WDDM may back device memory with system RAM): the GPU's read
+            // rate over each, in GB/s - VRAM reads at hundreds, system memory at the PCIe rate (~25)
+            cudaStream_t ps = nullptr;
+            uint32_t* sink = nullptr;
+            cudaEvent_t e0 = nullptr, e1 = nullptr;
+            if (cudaStreamCreateWithFlags(&ps, cudaStreamNonBlocking) == cudaSuccess &&
+                cudaMalloc((void**) &sink, 4) == cudaSuccess && cudaEventCreate(&e0) == cudaSuccess &&
+                cudaEventCreate(&e1) == cudaSuccess) {
+                auto rate = [&](const void* p, uint64_t bytes) {
+                    strata::kernels::read_probe(p, bytes, sink, ps);
+                    cudaEventRecord(e0, ps);
+                    for (int i = 0; i < 3; ++i) strata::kernels::read_probe(p, bytes, sink, ps);
+                    cudaEventRecord(e1, ps);
+                    cudaEventSynchronize(e1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    return ms > 0 ? 3.0 * (double) bytes / (ms * 1e6) : 0.0;
+                };
+                auto map = [&](const char* what, const void* base, uint64_t bytes) {
+                    if (base == nullptr || bytes == 0) return;
+                    const uint64_t chunk = 256ull << 20;
+                    std::string line;
+                    char b[16];
+                    double lo = 1e30, hi = 0;
+                    for (uint64_t off = 0; off < bytes; off += chunk) {
+                        const double r = rate((const uint8_t*) base + off, std::min(chunk, bytes - off));
+                        lo = std::min(lo, r);
+                        hi = std::max(hi, r);
+                        std::snprintf(b, sizeof b, " %.0f", r);
+                        line += b;
+                    }
+                    std::fprintf(stderr, "strata vram probe: %s %.2f GiB, GB/s per 256 MiB (min %.0f, max %.0f):%s\n", what,
+                                 (double) bytes / 1073741824.0, lo, hi, line.c_str());
+                };
+                map("expert cache", xcache.device_slot(0), (uint64_t) xcache.bytes());
+                if (native_head.loaded()) map("main head", native_head.weights(), native_head.weight_bytes());
+            }
+            cudaGetLastError();
+            if (e0) cudaEventDestroy(e0);
+            if (e1) cudaEventDestroy(e1);
+            if (sink) cudaFree(sink);
+            if (ps) cudaStreamDestroy(ps);
+        }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -4111,6 +4248,77 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // debug (STRATA_DBG_ARENA=1, the "!!!" hunt): the experts' bytes in RAM against what they were when the engine
+        // became ready.  The first window's NaN came from the CPU pool reading layer-0 experts whose RAM blobs had
+        // changed since the start (a different checksum in every failing start): this says which experts change, in
+        // which phase of the request, and - for layer 0, kept as a copy - where and into what.
+        static const bool dbg_arena_on = std::getenv("STRATA_DBG_ARENA") != nullptr;
+        std::vector<uint64_t> dbg_arena_sum;
+        std::vector<uint8_t> dbg_arena_ref0;
+        auto dbg_blob_sum = [](const uint8_t* b, size_t nb) {
+            uint64_t h = 0, w = 0;
+            for (size_t i = 0; i + 8 <= nb; i += 8) {
+                std::memcpy(&w, b + i, 8);
+                h = (h ^ w) * 0x9E3779B97F4A7C15ull + (h >> 29);
+            }
+            return h;
+        };
+        auto dbg_arena = [&](const char* where, int64_t layers) {
+            if (!dbg_arena_on || srcp == nullptr) return;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            const auto t0 = Clock::now();
+            const bool first = dbg_arena_sum.empty();
+            const size_t nb0 = (size_t) lay.blob_bytes(0);
+            if (first) {
+                dbg_arena_sum.assign((size_t) (g.n_layers * g.n_expert), 0);
+                dbg_arena_ref0.resize(nb0 * (size_t) g.n_expert);
+                for (int64_t ex = 0; ex < g.n_expert; ++ex)
+                    if (const uint8_t* b = srcp->blob(0, ex)) std::memcpy(dbg_arena_ref0.data() + (size_t) ex * nb0, b, nb0);
+                layers = g.n_layers;
+            }
+            int64_t changed = 0, lo_l = -1, lo_e = -1, hi_l = -1, hi_e = -1;
+            for (int64_t l = 0; l < std::min<int64_t>(layers, g.n_layers); ++l) {
+                const size_t nb = (size_t) lay.blob_bytes(l);
+                for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                    const uint8_t* b = srcp->blob(l, ex);
+                    if (b == nullptr) continue;
+                    const uint64_t h = dbg_blob_sum(b, nb);
+                    uint64_t& was = dbg_arena_sum[(size_t) (l * g.n_expert + ex)];
+                    if (first) { was = h; continue; }
+                    if (h == was) continue;
+                    if (changed++ == 0) { lo_l = l; lo_e = ex; }
+                    hi_l = l; hi_e = ex;
+                    if (changed > 6) continue;
+                    std::fprintf(stderr, "strata dbg: arena %s: layer %lld expert %lld CHANGED in RAM (blob %p, arena offset %llu)",
+                                 where, (long long) l, (long long) ex, (const void*) b,
+                                 (unsigned long long) lay.blob_offset(l, ex));
+                    if (l == 0) {
+                        const uint8_t* r = dbg_arena_ref0.data() + (size_t) ex * nb0;
+                        size_t f = 0, la = 0, nd = 0, zeros = 0;
+                        while (f < nb && b[f] == r[f]) ++f;
+                        for (size_t i = f; i < nb; ++i)
+                            if (b[i] != r[i]) { ++nd; la = i; zeros += b[i] == 0; }
+                        std::fprintf(stderr, ": bytes %zu..%zu of %zu, %zu differ (%zu of them now 0); now", f, la, nb, nd, zeros);
+                        for (size_t i = f; i < std::min(nb, f + 24); ++i) std::fprintf(stderr, " %02x", b[i]);
+                        std::fprintf(stderr, "; was");
+                        for (size_t i = f; i < std::min(nb, f + 24); ++i) std::fprintf(stderr, " %02x", r[i]);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            if (first)
+                std::fprintf(stderr, "strata dbg: arena %s: %lld layers summed (%.0f ms)\n", where, (long long) g.n_layers, ms);
+            else
+                std::fprintf(stderr, "strata dbg: arena %s: %lld of %lld layers checked, %lld experts changed (from layer %lld "
+                             "expert %lld to layer %lld expert %lld; %.0f ms)\n", where,
+                             (long long) std::min<int64_t>(layers, g.n_layers), (long long) g.n_layers, (long long) changed,
+                             (long long) lo_l, (long long) lo_e, (long long) hi_l, (long long) hi_e, ms);
+            std::fflush(stderr);
+        };
+        dbg_arena("at ready", g.n_layers);
+        // debug (the "!!!" hunt): STRATA_DBG_SYNC_READY - every queue drained before the first request
+        if (static const bool s = std::getenv("STRATA_DBG_SYNC_READY") != nullptr; s) cudaDeviceSynchronize();
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -4398,12 +4606,19 @@ int main(int argc, char** argv) {
             live_ok = false;   // until this request has finished, the session is in between
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
+                // THE RESET MUST HAVE LANDED BEFORE ANY OTHER STREAM WRITES THE STATE, AND A STREAM SYNC DID NOT SAY SO.
+                // On Windows HIP (ROCm 7.13, RX 6950 XT) cudaStreamSynchronize(main_stream) returned while these
+                // memsets - ~1.6 GB of KV at 131K context, the GDN states, the PLE history - were still running on a
+                // fresh process's first request; the prompt path and the verify windows (their own streams) then wrote
+                // the state and the late zeroing wiped it: zero GDN state and PLE history at the prompt's end, the
+                // first window NaN, the reply "!!!".  1 start in 3 in a server-restart loop (tuning/nan_serverloop.py)
+                // with a per-layer debug sync, 0 in 20 with a device sync here or later; see tuning/LOG.md.
                 strata::core::session_zero(ss, g, nullptr, main_cs);
-                cudaStreamSynchronize(main_stream);
+                cudaDeviceSynchronize();
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
-                    cudaStreamSynchronize(st->stream);
+                    cudaDeviceSynchronize();
                 }
                 checks.clear();
             } else if (!from_live) {
@@ -4418,11 +4633,11 @@ int main(int argc, char** argv) {
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
                     strata::core::session_zero(ss, g, nullptr, main_cs);
-                    cudaStreamSynchronize(main_stream);
+                    cudaDeviceSynchronize();   // not a stream sync: see the reset above
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
                         strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
-                        cudaStreamSynchronize(st->stream);
+                        cudaDeviceSynchronize();
                     }
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
@@ -4497,7 +4712,8 @@ int main(int argc, char** argv) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
-                    if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
+                    if (!ver.commit(T, e) || !ver.finish(e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))
+                        return false;   // (prompt reading keeps the commit synchronous: checkpoints read the state)
                     q += T;
                 }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
@@ -4524,6 +4740,7 @@ int main(int argc, char** argv) {
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     host_res[(size_t) i] = slot;
+                    if (dbg_slots_on && p.cache == &xcache) dbg_slot_note[(size_t) slot] = {'r', dbg_req, dbg_win.load(), i};
                 }
                 if (!p.cache->sync_queued(e)) return false;
                 p.lent.clear();
@@ -4579,7 +4796,79 @@ int main(int argc, char** argv) {
                 if (any) res_upload();
                 return true;
             };
+            // debug (STRATA_DBG_SLOTS=1): every resident expert's CUDA0 slot against its RAM blob, byte for byte; a
+            // slot that differs is reported with its last writer and, if it holds another expert of its layer, which
+            auto dbg_check_slots = [&](const char* where) {
+                if (!dbg_slots_on || d_res == nullptr || multi_gpu) return;
+                const auto t0 = Clock::now();
+                cudaDeviceSynchronize();
+                std::vector<uint8_t> got;
+                int64_t checked = 0, bad = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                    got.resize(nb);
+                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                        const size_t i = (size_t) (l * g.n_expert + ex);
+                        const int32_t slot = host_res[i];
+                        if (slot < 0) continue;
+                        const uint8_t* b = srcp->blob(l, ex);
+                        if (b == nullptr) continue;
+                        if (cudaMemcpy(got.data(), xcache.device_slot(slot), nb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            std::fprintf(stderr, "strata dbg: slots %s: read-back of slot %d failed\n", where, (int) slot);
+                            return;
+                        }
+                        ++checked;
+                        if (std::memcmp(got.data(), b, nb) == 0) continue;
+                        ++bad;
+                        size_t first = 0, ndiff = 0, last = 0;
+                        while (first < nb && got[first] == b[first]) ++first;
+                        for (size_t k = first; k < nb; ++k)
+                            if (got[k] != b[k]) { ++ndiff; last = k; }
+                        int32_t holds = -1;   // another expert of the layer whose blob the slot holds
+                        for (int64_t o2 = 0; o2 < g.n_expert && holds < 0; ++o2) {
+                            const uint8_t* b2 = srcp->blob(l, o2);
+                            if (o2 != ex && b2 && std::memcmp(got.data(), b2, nb) == 0) holds = (int32_t) o2;
+                        }
+                        const SlotNote& sn = dbg_slot_note[(size_t) slot];
+                        if (bad <= 16)
+                            std::fprintf(stderr, "strata dbg: slots %s (request %d, window %lld): layer %lld expert %lld slot %d "
+                                         "DIFFERS: bytes %zu..%zu, %zu of %zu differ; holds expert %d; last written by '%c' "
+                                         "(request %d, window %lld, pair %d)\n", where, (int) dbg_req,
+                                         (long long) dbg_win.load(), (long long) l, (long long) ex, (int) slot, first, last,
+                                         ndiff, nb, (int) holds, sn.kind ? sn.kind : '0', (int) sn.req, (long long) sn.win,
+                                         (int) sn.pair);
+                    }
+                }
+                // the device's copy of the residency table, which the verify windows' plan reads
+                std::vector<int32_t> dres(host_res.size());
+                int64_t res_bad = 0;
+                if (cudaMemcpy(dres.data(), d_res, dres.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess)
+                    for (size_t i = 0; i < dres.size(); ++i)
+                        if (dres[i] != host_res[i] && ++res_bad <= 8)
+                            std::fprintf(stderr, "strata dbg: slots %s: residency DIFFERS at layer %lld expert %lld: "
+                                         "device %d, host %d\n", where, (long long) (i / g.n_expert),
+                                         (long long) (i % g.n_expert), (int) dres[i], (int) host_res[i]);
+                std::fprintf(stderr, "strata dbg: slots %s (request %d): %lld checked, %lld differ, %lld table entries "
+                             "differ (%.0f ms)\n", where, (int) dbg_req, (long long) checked, (long long) bad,
+                             (long long) res_bad, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                std::fflush(stderr);
+            };
+            ++dbg_req;
+            // debug (STRATA_DBG_PHASES=1): where a request's prompt time goes
+            static const bool dbg_phases = std::getenv("STRATA_DBG_PHASES") != nullptr;
+            double ph_join = 0, ph_lend = 0, ph_batched = 0, ph_windows = 0, ph_ckpt = 0, ph_refill = 0;
+            auto ms_from = [](Clock::time_point a) { return std::chrono::duration<double, std::milli>(Clock::now() - a).count(); };
+            const auto t_join = Clock::now();
             apply_pending(true);
+            ph_join = ms_from(t_join);
+            // debug (the "!!!" hunt): the slot check at a request's start (a device sync, ~0.5 s of reads) made the
+            // first request's NaN go away - which part of it: STRATA_DBG_SYNC_START (only cudaDeviceSynchronize) or
+            // STRATA_DBG_DELAY_START (only a 600 ms pause)
+            if (static const bool s = std::getenv("STRATA_DBG_SYNC_START") != nullptr; s) cudaDeviceSynchronize();
+            if (static const bool s = std::getenv("STRATA_DBG_DELAY_START") != nullptr; s)
+                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            dbg_check_slots("request start");
+            dbg_arena("at the request's start", g.n_layers);
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
@@ -4597,6 +4886,7 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            if (ver.device_plan_all()) drive.d.pcie_num = 0;   // STRATA_VERIFY_DEVICE_PLAN=2: no PCIe share
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
@@ -4630,6 +4920,7 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
+                const auto tlr = Clock::now();
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -4638,8 +4929,12 @@ int main(int argc, char** argv) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
+                (win ? ph_refill : ph_lend) += ms_from(tlr);
                 const auto tsp = Clock::now();
+                dbg_arena(win ? "before the windows (after the refill)" : "before the batched read (after the lend)", 10);
                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
+                dbg_arena(win ? "after the windows" : "after the batched read", 10);
+                (win ? ph_windows : ph_batched) += ms_from(tsp);
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -4663,16 +4958,26 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                const auto tck = Clock::now();
                 if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
+                ph_ckpt += ms_from(tck);
+                dbg_arena("after the checkpoint", 10);
             }
+            const auto trf = Clock::now();
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
+            ph_refill += ms_from(trf);
+            if (dbg_phases)
+                std::fprintf(stderr, "strata dbg: request %d prompt phases (ms): join %.1f, lend %.1f, batched %.1f, "
+                             "windows %.1f, checkpoints %.1f, refill %.1f\n", (int) dbg_req, ph_join, ph_lend, ph_batched,
+                             ph_windows, ph_ckpt, ph_refill);
             tr("prompt done (slots refilled)");
+            dbg_check_slots("after the prompt");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
@@ -4700,14 +5005,15 @@ int main(int argc, char** argv) {
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run;
                 int64_t misses, entries, hits, pcie;
+                double ple;
             };
             auto dec_snap = [&]() {
                 return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
                                drive.d.ms_run, drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
-                               drive.d.pcie_experts};
+                               drive.d.pcie_experts, ver.ms_ple};
             };
             const DecSnap ds0 = dec_snap();
-            double dt_run = 0, dt_commit = 0, dt_draft = 0;
+            double dt_run = 0, dt_commit = 0, dt_draft = 0, dt_pre = 0, dt_join = 0;   // pre: before the window; join: the adaptive tier
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
@@ -4740,6 +5046,10 @@ int main(int argc, char** argv) {
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 apply_pending(false);
+                if (!adapt_ok_bg.load()) {
+                    std::printf("ERR an adaptive refill failed\n");
+                    return 1;
+                }
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -4761,12 +5071,20 @@ int main(int argc, char** argv) {
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
-                std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
-                bool adapt_ok = true;
-                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                dbg_win.fetch_add(1, std::memory_order_relaxed);
+                // the adaptive tier beside the commit and the draft, and on into the next windows (adapt_bg above)
+                bool adapt_started = false;
+                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0 && !adapt_bg.joinable()) {
+                    adapt_published.store(false);
+                    adapt_issued.store(false);
+                    adapt_bg = std::thread([&] {
+                        if (!adapt()) adapt_ok_bg.store(false);
+                        adapt_published.store(true, std::memory_order_release);
+                        adapt_issued.store(true, std::memory_order_release);
+                    });
+                    adapt_started = true;
+                }
                 if (!ver.commit(a + 1, err)) {
-                    if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
@@ -4796,10 +5114,16 @@ int main(int argc, char** argv) {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                    dt_pre += msd(round0, tw0);
                     ++dec_windows; dec_T += T;
                 }
-                if (adapt_thr.joinable()) adapt_thr.join();
-                if (!adapt_ok) {
+                if (adapt_started) {
+                    const Clock::time_point tj = Clock::now();
+                    if (adapt_join_all) adapt_bg.join();
+                    else while (!adapt_published.load(std::memory_order_acquire)) std::this_thread::yield();
+                    dt_join += std::chrono::duration<double, std::milli>(Clock::now() - tj).count();
+                }
+                if (!adapt_ok_bg.load()) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
                 }
@@ -4815,21 +5139,29 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            if (!ver.finish(err)) {   // the last commit (STRATA_ASYNC_COMMIT) lands before anything reads the state
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
                 std::fprintf(stderr, "strata decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
                                      "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
-                                     "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
+                                     "CPU %.2f] + stage %.2f [ple %.2f]) + commit/emit %.2f + draft %.2f + before the window %.2f + "
+                                     "adaptive join %.2f; per layer-window (counts): CPU experts "
                                      "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f\n",
                              (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
                              (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
-                             (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
+                             (d1.host - ds0.host) / w, (d1.ple - ds0.ple) / w, dt_commit / w, dt_draft / w, dt_pre / w, dt_join / w,
+                             (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+                const std::string mp = mtp.profile_report();
+                if (!mp.empty()) std::fprintf(stderr, "strata decode MTP stages (ms/graph):%s\n", mp.c_str());
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
@@ -5083,6 +5415,33 @@ int main(int argc, char** argv) {
                 for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
                 if (prefill.draft_kv(mtp, R_rows, nxt.data(), T, p0, e)) return true;   // E-9
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
+            };
+        }
+        // debug: STRATA_PREFILL_DUMP_LOGITS=<file> writes the logits of every 16th prompt position (the position, then
+        // n_vocab floats) from the prompt path's final residuals through the token path's head - the prompt path's
+        // numerics A/B (tuning/prefill_kl.py; a native pack dumps no per-token logits otherwise)
+        if (const char* dl = std::getenv("STRATA_PREFILL_DUMP_LOGITS")) {
+            std::FILE* lf = std::fopen(dl, "wb");
+            if (lf == nullptr) { std::fprintf(stderr, "strata generate: cannot write %s\n", dl); return 1; }
+            auto inner = prefill.on_chunk;
+            prefill.on_chunk = [&, inner, lf](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                const int64_t D = g.hc * g.n_embd;
+                std::vector<float> row((size_t) n_vocab);
+                for (int64_t t = (16 - p0 % 16) % 16; t < T; t += 16) {
+                    const int64_t pos = p0 + t;
+                    if (cudaMemcpyAsync(ss.block.R, R_rows + t * D, (size_t) D * 4, cudaMemcpyDeviceToDevice,
+                                        (cudaStream_t) main_cs) != cudaSuccess || !run_head(main_cs) ||
+                        cudaMemcpyAsync(row.data(), d_logits, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost,
+                                        (cudaStream_t) main_cs) != cudaSuccess ||
+                        cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+                        e = "the prompt logits dump failed: " + err;
+                        return false;
+                    }
+                    std::fwrite(&pos, sizeof pos, 1, lf);
+                    std::fwrite(row.data(), 4, row.size(), lf);
+                }
+                std::fflush(lf);
+                return inner ? inner(R_rows, T, p0, e) : true;
             };
         }
         const Clock::time_point tp0 = Clock::now();
@@ -5392,7 +5751,7 @@ int main(int argc, char** argv) {
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
-        if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
+        if (drive.d.pcie_num < 0 || ver.device_plan_all()) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
@@ -5466,6 +5825,8 @@ int main(int argc, char** argv) {
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (ver.device_plan_all() && !swaps.empty() && d_res != nullptr)   // see the serve path's adapt
+                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             for (float& v : drive.d.usage) v *= 0.7f;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -5594,6 +5955,10 @@ int main(int argc, char** argv) {
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
+        }
+        if (!ver.finish(err)) {   // the last commit (STRATA_ASYNC_COMMIT)
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
         }
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,

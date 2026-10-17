@@ -86,6 +86,9 @@ public:
 
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
+    /// STRATA_MTP_PROFILE=1: the draft graphs' GPU time by stage (gpu_stamp at the full layer's stage boundaries) and
+    /// the host's launch-to-sync time per graph, as ms per graph since the last call; "" when the profiler is off.
+    std::string profile_report();
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
     /// state, the first cell a round can still read, its device, and a wait for its own stream.
@@ -121,6 +124,14 @@ private:
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
+    // the stage profiler (STRATA_MTP_PROFILE): stamps 0-13 in the full layer, 14 at the start of a round graph
+    static constexpr int kMtpProf = 16;
+    int prof_state_ = -1;                       ///< -1 not decided yet, 0 off, 1 on
+    unsigned long long* prof_ = nullptr;        ///< device: the last graph's stamps
+    double prof_sum_[kMtpProf] = {};
+    double prof_host_[2] = {}, prof_graphs_[2] = {};   ///< [0] round graphs, [1] step graphs
+    bool prof_ready();
+    void prof_collect(int kind, double host_ms);
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;

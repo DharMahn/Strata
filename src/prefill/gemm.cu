@@ -3,6 +3,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -19,6 +20,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <memory>
 
@@ -40,6 +42,81 @@ void ck(cublasStatus_t s, const char* what) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
         std::exit(1);
     }
+}
+
+// dst[r * cols + c] = src[r * ld + c] as FP32, from BF16 or FP16 bits (exact either way)
+__global__ void widen_kernel(const uint16_t* __restrict__ src, int64_t ld, float* __restrict__ dst, int64_t rows,
+                             int64_t cols, bool bf) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) return;
+    const int64_t r = i / cols, c = i - r * cols;
+    const uint16_t v = src[r * ld + c];
+    dst[i] = bf ? __uint_as_float((uint32_t) v << 16) : __half2float(__ushort_as_half(v));
+}
+void widen(const uint16_t* src, int64_t ld, float* dst, int64_t rows, int64_t cols, bool bf, cudaStream_t s) {
+    const int64_t n = rows * cols;
+    if (n > 0) widen_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(src, ld, dst, rows, cols, bf);
+}
+
+// RDNA2: rocBLAS ships tuned gfx1030 kernels only for FP16->FP16 and FP32 GEMMs.  The BF16->FP32 and FP16->FP32
+// calls below get its generic fallback kernels: ~6 TFLOPS on the RX 6950 XT against ~22 for the tuned FP32 ones
+// (tuning/micro/gemm_bench.cu; tuning/LOG.md, "rocBLAS on gfx1030").  There the inputs are widened to FP32 - exact
+// for both - and multiplied by the tuned SGEMM.  STRATA_GEMM_WIDEN=0/1 overrides the architecture check.
+// A product with a handful of outputs (the hyper-connections' inject, N 4; the shared expert's gate, N 1) is a read
+// of X, not a GEMM: one wave per row, each lane 8 values per step, the N dot products summed over the wave.  On the
+// widened route the SGEMM spent 4 ms per inject (X widened, then N = 4 tiles); this reads X once (~0.4 ms).
+constexpr int kSmallN = 8;
+__global__ void small_n_kernel(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W, float* __restrict__ Y,
+                               int64_t T, int N, int64_t K, int64_t ldy, float beta) {
+    const int64_t row = (int64_t) blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= T) return;
+    const uint16_t* x = X + row * K;
+    float acc[kSmallN] = {};
+    for (int64_t k = (int64_t) lane * 8; k < K; k += 256) {
+        const uint4 xv = *reinterpret_cast<const uint4*>(x + k);
+        const uint32_t xs[4] = {xv.x, xv.y, xv.z, xv.w};
+        float xf[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            xf[2 * i] = __uint_as_float(xs[i] << 16);
+            xf[2 * i + 1] = __uint_as_float(xs[i] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int n = 0; n < kSmallN; ++n) {
+            if (n >= N) break;
+            const uint4 wv = *reinterpret_cast<const uint4*>(W + (int64_t) n * K + k);
+            const uint32_t ws[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[n] = fmaf(xf[2 * i], __uint_as_float(ws[i] << 16), acc[n]);
+                acc[n] = fmaf(xf[2 * i + 1], __uint_as_float(ws[i] & 0xffff0000u), acc[n]);
+            }
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < kSmallN; ++n) {
+        if (n >= N) break;
+        float v = acc[n];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) Y[row * ldy + n] = beta == 0.0f ? v : fmaf(beta, Y[row * ldy + n], v);
+    }
+}
+
+bool widen_route() {
+    static const bool on = [] {
+        if (const char* v = std::getenv("STRATA_GEMM_WIDEN")) return std::atoi(v) != 0;
+#if defined(__HIPCC__)
+        int dev = 0;
+        cudaDeviceProp p{};
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
+        return std::strncmp(p.gcnArchName, "gfx103", 6) == 0;
+#else
+        return false;
+#endif
+    }();
+    return on;
 }
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -337,10 +414,60 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     return true;
 }
 
+// STRATA_GEMM_SMALL_N=0: the small-N kernel off (those products take the widened route) - the A/B
+bool small_n_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GEMM_SMALL_N"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
+// The widened product in tiles of the scratch `ws` (`ws_floats`): W tiles of [nc, kc] and X tiles of [rc, kc] in FP32,
+// the K tiles summed into Y (beta 1 after the first).  Whole rows of W and X when they fit; K is split when a tile
+// of whole X rows would be shorter than 2048 rows (the tuned SGEMM's rate drops below that: hc down, K 10240).
+// false: not even a small tile fits (the caller takes the BLAS path).
+bool Gemm::widened(const uint16_t* X, const uint16_t* W, bool bf, float* Y, int64_t T, int64_t N, int64_t K,
+                   int64_t ldy, float beta, float* ws, int64_t ws_floats) {
+    if (ws == nullptr || ws_floats <= 0) return false;
+    const int64_t want = std::min<int64_t>(T, 2048);
+    int64_t kc = K, nc = N, rc = 0;
+    for (;;) {
+        nc = std::min<int64_t>(N, std::max<int64_t>(64, (ws_floats / 2) / kc / 64 * 64));
+        rc = std::min<int64_t>(T, (ws_floats - nc * kc) / kc);
+        if (rc >= want || kc <= 512) break;
+        kc = std::max<int64_t>(512, (kc / 2 + 255) / 256 * 256);
+    }
+    if (rc < std::min<int64_t>(T, 256) || nc * kc + rc * kc > ws_floats) return false;
+    const cudaStream_t s = (cudaStream_t) stream_;
+    float* wf = ws;
+    float* xf = ws + nc * kc;
+    const float alpha = 1.0f;
+    for (int64_t n0 = 0; n0 < N; n0 += nc) {
+        const int64_t nn = std::min(nc, N - n0);
+        for (int64_t k0 = 0; k0 < K; k0 += kc) {
+            const int64_t kk = std::min(kc, K - k0);
+            const float b = k0 == 0 ? beta : 1.0f;
+            widen(W + n0 * K + k0, K, wf, nn, kk, bf, s);
+            for (int64_t r0 = 0; r0 < T; r0 += rc) {
+                const int64_t rr = std::min(rc, T - r0);
+                widen(X + r0 * K + k0, K, xf, rr, kk, bf, s);
+                ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) nn, (int) rr, (int) kk, &alpha,
+                                wf, CUDA_R_32F, (int) kk, xf, CUDA_R_32F, (int) kk, &b, Y + r0 * ldy + n0, CUDA_R_32F,
+                                (int) ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                   "cublasGemmEx widened");
+            }
+        }
+    }
+    return true;
+}
+
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    if (widen_route() && N <= kSmallN && K % 8 == 0 && ((uintptr_t) X | (uintptr_t) W) % 16 == 0 && small_n_on()) {
+        small_n_kernel<<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream_>>>(X, W, Y, T, (int) N, K, ldy, beta);
+        return;
+    }
+    if (widen_route() && widened(X, W, true, Y, T, N, K, ldy, beta, (float*) scratch_, scratch_elems_ / 2)) return;
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
@@ -359,6 +486,12 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    if (widen_route()) {
+        // a W that `native` dequantized into the scratch: the tiles go after it
+        const bool in_scratch = W >= scratch_ && W < scratch_ + scratch_elems_;
+        const int64_t used = in_scratch ? ((W - scratch_) + N * K + 1) / 2 * 2 : 0;   // FP16 elements, kept even
+        if (widened(X, W, false, Y, T, N, K, ldy, beta, (float*) (scratch_ + used), (scratch_elems_ - used) / 2)) return;
+    }
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,

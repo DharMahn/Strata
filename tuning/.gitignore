@@ -1,0 +1,7 @@
+﻿bin/
+micro/*.exe
+micro/*.pdb
+micro/*.lib
+micro/*.exp
+__pycache__/
+

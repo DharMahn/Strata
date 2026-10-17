@@ -37,6 +37,7 @@ td.log
 /strata-*.json
 /strata-*.log
 /build-strata.bat
+/build-strata-hip.bat
 
 # image encoder (setup.py --vision): build output and the generated build script
 build-vision*/
@@ -47,5 +48,11 @@ build-vision.bat
 /build-release*/
 /dist/
 *.done
-/third_party/*.zip
-
+/third_party/*.zip
+
+# local diagnostics and measurement output of the RDNA2 fork
+hang-watch/
+tuning/results/
+tuning/bin/
+requests-*.jsonl
+*.before-*

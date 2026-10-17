@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -1072,3 +1073,242 @@ class SharingTheGpu(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThinkPrefix(unittest.TestCase):
+    """strata_think_prefix: the thinking's first words are written for the model - appended to the prompt after the
+    open <think>, and sent to the client as the start of the reasoning, so the reply reads as if the model wrote them."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingPrompt(tok, " wants a pelican.</think>\n\nok", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def prompt_text(self):
+        return ByteTokenizer().decode(self.engine.last_ids)
+
+    def chat(self, **extra):
+        b = self.post("/v1/chat/completions", {"model": "x", "max_tokens": 100,
+                                               "messages": [{"role": "user", "content": "pelican"}], **extra})
+        return b["choices"][0]["message"]
+
+    def test_true_writes_the_user(self):
+        m = self.chat(strata_think_prefix=True)
+        self.assertTrue(self.prompt_text().endswith("<think>\nLet me think about this. The user"), self.prompt_text()[-40:])
+        self.assertEqual(m["reasoning_content"], "Let me think about this. The user wants a pelican.")
+        self.assertEqual(m["content"], "ok")
+
+    def test_absent_or_false_changes_nothing(self):
+        for extra in ({}, {"strata_think_prefix": False}):
+            m = self.chat(**extra)
+            self.assertTrue(self.prompt_text().endswith("<think>\n"), extra)
+            self.assertEqual(m["reasoning_content"], " wants a pelican.", extra)
+
+    def test_own_words(self):
+        m = self.chat(strata_think_prefix="Okay, so the user")
+        self.assertTrue(self.prompt_text().endswith("<think>\nOkay, so the user"))
+        self.assertTrue(m["reasoning_content"].startswith("Okay, so the user wants"))
+
+    def test_not_when_thinking_is_off(self):
+        self.chat(strata_think_prefix=True, reasoning_effort="none")
+        self.assertNotIn("Let me think", self.prompt_text())
+
+    TOOL_LOOP = [{"role": "user", "content": "pelican"},
+                 {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
+                     "name": "write_file", "arguments": "{\"path\": \"p.svg\"}"}}]},
+                 {"role": "tool", "tool_call_id": "c1", "content": "wrote 200 bytes"}]
+
+    def test_not_after_a_tool_result(self):
+        # an agent's next step after a tool result continues in the model's own words
+        m = self.chat(strata_think_prefix=True, messages=self.TOOL_LOOP)
+        self.assertTrue(self.prompt_text().endswith("</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"),
+                        self.prompt_text()[-80:])
+        self.assertEqual(m["reasoning_content"], " wants a pelican.")
+
+    def test_own_opening_after_a_tool_result(self):
+        # strata_think_prefix_tool: an opening for those steps that does not name the request
+        self.chat(strata_think_prefix=True, strata_think_prefix_tool=True, messages=self.TOOL_LOOP)
+        self.assertTrue(self.prompt_text().endswith("</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nLet me"),
+                        self.prompt_text()[-60:])
+        m = self.chat(strata_think_prefix=True, strata_think_prefix_tool="Okay, so", messages=self.TOOL_LOOP)
+        self.assertTrue(self.prompt_text().endswith("<think>\nOkay, so"))
+        self.assertTrue(m["reasoning_content"].startswith("Okay, so wants"))
+        self.chat(strata_think_prefix_tool=True)   # a turn from the user's message: the tool opening is not used
+        self.assertTrue(self.prompt_text().endswith("<think>\n"), self.prompt_text()[-30:])
+
+    def test_the_main_switch_turns_the_tool_opening_off_too(self):
+        # the config has both on; a client that turns "start thinking in prose" off gets no opening anywhere
+        self.svc.sampling_defaults = {"strata_think_prefix": True, "strata_think_prefix_tool": True}
+        try:
+            self.chat(messages=self.TOOL_LOOP)
+            self.assertTrue(self.prompt_text().endswith("<think>\nLet me"), self.prompt_text()[-30:])
+            self.chat(strata_think_prefix=False, messages=self.TOOL_LOOP)
+            self.assertTrue(self.prompt_text().endswith("<think>\n"), self.prompt_text()[-30:])
+            self.chat(strata_think_prefix=False, strata_think_prefix_tool=True, messages=self.TOOL_LOOP)
+            self.assertTrue(self.prompt_text().endswith("<think>\nLet me"), self.prompt_text()[-30:])
+        finally:
+            self.svc.sampling_defaults = {}
+
+    TWO_TURNS = TOOL_LOOP[:1] + [dict(TOOL_LOOP[1], reasoning_content="FIRSTTHOUGHT"), TOOL_LOOP[2],
+                                 {"role": "assistant", "reasoning_content": "SECONDTHOUGHT", "content": "done"},
+                                 {"role": "user", "content": "now a heron"},
+                                 dict(TOOL_LOOP[1], reasoning_content="THIRDTHOUGHT"), TOOL_LOOP[2]]
+
+    def test_thinking_sent_back_is_kept_for_the_current_request_only(self):
+        # sampling.preserve_thinking false (Hermes with reasoning_echo): a tool loop reads its own earlier steps'
+        # thinking, the previous request's is dropped
+        self.chat(messages=self.TWO_TURNS)                         # the template's default: all of it
+        for thought in ("FIRSTTHOUGHT", "SECONDTHOUGHT", "THIRDTHOUGHT"):
+            self.assertIn(thought, self.prompt_text())
+        plain = [{k: v for k, v in m.items() if k != "reasoning_content"} for m in self.TWO_TURNS]
+        self.chat(messages=plain)
+        before = self.prompt_text()
+        self.svc.sampling_defaults = {"preserve_thinking": False}
+        try:
+            self.chat(messages=self.TWO_TURNS)
+            self.assertIn("THIRDTHOUGHT", self.prompt_text())
+            self.assertNotIn("FIRSTTHOUGHT", self.prompt_text())
+            self.assertNotIn("SECONDTHOUGHT", self.prompt_text())
+            self.chat(messages=self.TWO_TURNS, chat_template_kwargs={"preserve_thinking": True})   # the request wins
+            self.assertIn("FIRSTTHOUGHT", self.prompt_text())
+            self.chat(messages=plain)                              # no thinking sent back: the prompt is what it was
+            self.assertEqual(self.prompt_text(), before)
+        finally:
+            self.svc.sampling_defaults = {}
+
+    def test_config_toggle(self):
+        # the documented switch (docs/THINK_PREFIX.md): no `sampling.strata_think_prefix` in the run config = the
+        # stock behaviour (nothing written, for every client); true = the opening for clients that ask for nothing
+        self.chat()
+        self.assertTrue(self.prompt_text().endswith("<think>\n"), "must be off with an empty config")
+        self.assertFalse(self.get("/settings")["server_defaults"]["strata_think_prefix"])
+        self.svc.sampling_defaults = {"strata_think_prefix": True}
+        try:
+            self.chat()
+            self.assertTrue(self.prompt_text().endswith("<think>\nLet me think about this. The user"))
+            self.assertTrue(self.get("/settings")["server_defaults"]["strata_think_prefix"])
+            self.chat(strata_think_prefix=False)                    # a request can still say no
+            self.assertTrue(self.prompt_text().endswith("<think>\n"))
+        finally:
+            self.svc.sampling_defaults = {}
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=30) as r:
+            return json.loads(r.read())
+
+    def test_a_new_message_after_tool_use(self):
+        msgs = self.TOOL_LOOP + [{"role": "assistant", "content": "done"}, {"role": "user", "content": "now a heron"}]
+        self.chat(strata_think_prefix=True, messages=msgs)
+        self.assertTrue(self.prompt_text().endswith("<think>\nLet me think about this. The user"), self.prompt_text()[-40:])
+
+    def test_anthropic_thinking_block(self):
+        b = self.post("/v1/messages", {"model": "x", "max_tokens": 100, "strata_think_prefix": True,
+                                       "messages": [{"role": "user", "content": "pelican"}]})
+        thinking = [c for c in b["content"] if c["type"] == "thinking"]
+        self.assertTrue(thinking and thinking[0]["thinking"].startswith("Let me think about this. The user wants"), b["content"])
+
+    def test_default_from_the_config_and_the_request_wins(self):
+        self.svc.sampling_defaults = {"strata_think_prefix": True}
+        try:
+            self.assertEqual(self.chat()["reasoning_content"], "Let me think about this. The user wants a pelican.")
+            self.assertEqual(self.chat(strata_think_prefix=False)["reasoning_content"], " wants a pelican.")
+        finally:
+            self.svc.sampling_defaults = {}
+
+
+class CountingEngine(MockEngine):
+    calls = 0
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.calls += 1
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class RequestsAtOnce(unittest.TestCase):
+    """Requests that overlap (Hermes sends two image calls at once) and non-streamed requests whose client leaves
+    (its image calls give up after 120 s): each waits for its turn, and nobody's reply is generated for nobody."""
+
+    def start(self, script, delay_s):
+        tok = ByteTokenizer()
+        self.engine = CountingEngine(tok, script, max_context=CTX, delay_s=delay_s)
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.port = self.httpd.server_address[1]
+
+    BODY = {"model": "x", "max_tokens": 3000, "reasoning_effort": "none", "messages": [{"role": "user", "content": "hi"}]}
+
+    def post(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                                     data=json.dumps(self.BODY).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())["choices"][0]["message"]["content"]
+
+    def leave(self, after_s):
+        """A non-streamed request whose client closes the connection `after_s` later."""
+        data = json.dumps(self.BODY).encode()
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+        time.sleep(after_s)
+        s.close()
+
+    def idle(self, within_s):
+        end = time.time() + within_s
+        while time.time() < end:
+            if not self.svc.status.get("busy") and not self.svc.status.get("queued"):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_every_one_of_three_requests_is_answered(self):
+        # the first one's end used to clear the status the second had just written: KeyError 'tail', no reply
+        self.start("y" * 300, 0.002)
+        out = {}
+
+        def go(k):
+            try:
+                out[k] = self.post()
+            except Exception as e:  # noqa: BLE001 - the failure is the result
+                out[k] = repr(e)
+        threads = [threading.Thread(target=go, args=(k,)) for k in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        self.assertEqual([out.get(k) for k in range(3)], ["y" * 300] * 3)
+        self.assertTrue(self.idle(2), self.svc.status)
+        self.assertEqual([h["output_tokens"] for h in self.svc.history], [301] * 3)
+
+    def test_a_request_stops_when_its_client_leaves(self):
+        self.start("y" * 3000, 0.01)                   # 30 s if nobody stops it
+        self.leave(0.3)
+        self.assertTrue(self.idle(6), self.svc.status)
+        self.assertEqual(self.svc.history[-1]["finish"], "disconnect")
+        self.assertLess(self.svc.history[-1]["output_tokens"], 1000)
+
+    def test_a_waiting_request_whose_client_leaves_never_starts(self):
+        self.start("y" * 300, 0.01)                    # 3 s per request
+        first = threading.Thread(target=self.post)
+        first.start()
+        time.sleep(0.3)
+        self.leave(0.3)                                # queued behind the first, then gone
+        first.join(30)
+        self.assertTrue(self.idle(4), self.svc.status)
+        self.assertEqual(self.engine.calls, 1)
+

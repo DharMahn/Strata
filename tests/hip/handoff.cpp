@@ -71,6 +71,9 @@ int main(){
   CHECK(hipMemcpyAsync(copy_ids_device,copy_route_ids.data(),10*4,hipMemcpyHostToDevice,stream));
   CHECK(hipMemcpyAsync(copy_weights_device,copy_route_weights.data(),10*4,hipMemcpyHostToDevice,stream));
   CHECK(hipGraphLaunch(exec,stream));
+#ifdef _WIN32
+  (void)hipStreamQuery(stream);   // one flush: WDDM submits the graph now (as session.cpp does)
+#endif
   const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
   // Do not query or synchronize the stream before validating the mapped payload.
   while(__atomic_load_n(copy_seq,__ATOMIC_ACQUIRE)!=(uint32_t)r){
@@ -103,6 +106,9 @@ int main(){
   CHECK(hipMemcpyAsync(gi,ids_src.data(),40,hipMemcpyHostToDevice,stream));
   CHECK(hipMemcpyAsync(gw,ws.data(),40,hipMemcpyHostToDevice,stream));
   CHECK(hipGraphLaunch(exec,stream));
+#ifdef _WIN32
+  (void)hipStreamQuery(stream);   // one flush: WDDM submits the graph now (as session.cpp does)
+#endif
   const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
   // No driver query or stream sync may make the payload visible to this observer.
   while(__atomic_load_n(flag,__ATOMIC_ACQUIRE)!=(uint32_t)r){

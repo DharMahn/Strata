@@ -1,6 +1,8 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -32,6 +34,13 @@ bool sync(std::string& error) {
 bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
+    if (static const bool dbg = std::getenv("STRATA_DBG_ARENA") != nullptr; dbg) {   // debug (the "!!!" hunt)
+        static int left = 60;
+        if (left > 0) {
+            --left;
+            std::fprintf(stderr, "strata dbg: snapshot copy: dst %p src %p, %zu B\n", (void*) dst, (const void*) src, (size_t) bytes);
+        }
+    }
     const auto status = cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);

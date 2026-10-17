@@ -109,6 +109,9 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// Wait for the last commit (STRATA_ASYNC_COMMIT leaves it running): call before anything outside the decode loop
+    /// reads the session's state (checkpoints, the next request's prompt).  False with `err` when it failed.
+    bool finish(std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -128,6 +131,7 @@ public:
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_ple = 0;   ///< part of ms_host: blocked on the window's PLE table rows (gather_batch)
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -146,6 +150,13 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    /// STRATA_VERIFY_DEVICE_PLAN=2: EVERY layer's VRAM groups are planned on the device (the misses stay the CPU's);
+    /// the GPU never waits for the host's plan.  Needs --pcie-frac 0 and a residency table the host keeps in step
+    /// with its own (generate.cpp uploads it on every eviction in this mode).
+    bool device_plan_all_ = false;
+public:
+    bool device_plan_all() const { return device_plan_all_; }
+private:
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
@@ -191,6 +202,11 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    uint32_t* h_flagP_ = nullptr; uint32_t* m_flagP_ = nullptr;  // the window's PLE rows are in h_ple_
+    // STRATA_PLE_ASYNC (default on; 0 = off): the window's PLE rows are read while the GPU and the CPU run
+    // layer 0 - the graph copies them just before layer 1 behind flag P - instead of before the launch.  Fixed at the
+    // first capture.
+    bool ple_async_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)

@@ -31,7 +31,13 @@ int main(int argc, char** argv) {
     }
 
     try {
-        const strata::core::DeviceInfo d = strata::core::device_info(0);
+        std::string gpu_err;
+        if (strata::core::select_primary_gpu(gpu_err) < 0) {
+            std::fprintf(stderr, "strata-device: %s\n", gpu_err.c_str());
+            return 1;
+        }
+        const int gpu = strata::core::primary_gpu();
+        const strata::core::DeviceInfo d = strata::core::device_info(gpu);
         std::printf("device %d: %s\n", d.ordinal, d.name.c_str());
 #if defined(STRATA_USE_HIP)
         std::printf("  HIP arch            %s wave32 (compiled for %s)\n", d.arch.c_str(),
@@ -56,7 +62,7 @@ int main(int argc, char** argv) {
             // path leaves NaNs rather than zeros.  A GPU test that only asks the driver for its name does not
             // test the runtime this file exists to provide.
             const uint64_t bytes = 64ull << 20;      // 64 MiB, small enough to be safe on any card
-            strata::core::DeviceArena arena(bytes, 0, /*poison=*/true);
+            strata::core::DeviceArena arena(bytes, gpu, /*poison=*/true);
             void* a = arena.alloc(1 << 20, 256);
             void* b = arena.alloc(1 << 20, 4096);
             if (((uintptr_t) a % 256) || ((uintptr_t) b % 4096)) {

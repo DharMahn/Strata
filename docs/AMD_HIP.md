@@ -1,9 +1,10 @@
-# Experimental AMD HIP backend (gfx1100, gfx1201)
+# Experimental AMD HIP backend (gfx1100, gfx1201; Windows gfx1030, gfx1031)
 
 This is a Linux source build for the RX 7900 XT / XTX (RDNA3, gfx1100) and the
 RX 9070 / 9070 XT / Radeon AI PRO R9700 (RDNA4, gfx1201; see [RDNA4](#rdna4-gfx1201)).
 It is opt-in; the NVIDIA installer and CUDA build remain the default. Other AMD
-architectures, wave64, Windows HIP, and mixed AMD/NVIDIA execution are outside this contribution.
+architectures, wave64 and mixed AMD/NVIDIA execution are outside this contribution.  (Windows and RDNA2 have their
+own section below: [Windows + RX 6800/6900 (gfx1030)](#windows--rx-68006900-gfx1030).)
 
 The backend maps the CUDA-shaped runtime and BLAS calls to HIP/hipBLAS, uses
 RDNA3/RDNA4's signed integer dot instruction for quantized kernels, and supplies
@@ -168,6 +169,68 @@ an RX 9070 XT 16 GB and a Radeon AI PRO R9700 32 GB (both gfx1201), a Ryzen 9 39
   one card or two and on engine 0.1.29 as well; not yet explained.
 - **Not validated:** gfx1200 (RX 9060 XT; a community report is #176), images, long contexts beyond 16K,
   answer-quality benchmarks.
+
+## Windows + RX 6800/6900 (gfx1030)
+
+An experimental port of this backend to Windows and to RDNA2 (RX 6800 / 6800 XT / 6900 XT / 6950 XT, gfx1030), built
+and run on an RX 6950 XT (16 GB) with a Ryzen 9 9950X and 64 GB of RAM.  `START-HERE.bat --backend hip` (chosen by
+itself on a PC with no NVIDIA card) installs AMD's ROCm into `.venv` from TheRock's Windows wheels (7.13, ~2.7 GB,
+no admin rights), compiles the engine with ROCm's clang (Visual Studio Build Tools provide the C++ libraries and the
+Windows SDK; any version from 2019 on) and starts it.  The RX 6700 XT (gfx1031, Navi 22, 12 GB) is recognised by
+setup (PCI ids 0x73C0-0x73DF) and compiled for with the same code and the same ROCm wheels, but **nobody has run it**.
+Other RDNA2 chips (gfx1032/1034) build the same code but are not detected by setup.
+
+What the port changed, and why:
+
+- **`sdot4` on RDNA2.**  gfx1030 has the plain signed dot4 (`v_dot4_i32_i8`) instead of RDNA3's `sudot4`;
+  `hip_compat/intrinsics.hpp` uses `__builtin_amdgcn_sdot4` there (verified on the card).
+- **The integrated Radeon.**  A Ryzen 7000/9000 desktop lists its CPU's Radeon (gfx1036) as HIP device 0, before the
+  real card, and Windows' `HIP_VISIBLE_DEVICES` cannot hide it (any index other than 0 makes the runtime list no
+  device).  The engine's own code means "the main GPU" by device 0, so the HIP shim (`hip_compat/cuda_runtime.h`)
+  numbers only the GPUs the binary has code for, from 0, in every device-ordinal call (`cudaSetDevice`,
+  `cudaGetDevice`, `cudaGetDeviceCount`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`): the iGPU is not
+  visible to the engine at all, every program starts on logical GPU 0, and a thread that never chose a device is moved
+  to it the first time it asks.  `STRATA_GPU=<n>` (a HIP ordinal, as `hipInfo` numbers them) picks one GPU by hand;
+  a PC where every GPU is usable keeps HIP's numbering.  Without this, the engine created a stream on the card and
+  then selected device 0 (the iGPU) for its next allocation: the runtime crashed on the first mixed-device command.
+  The runtime also loads a code object for *every* device it lists, so a code object without the iGPU's
+  architecture makes every launch on the real card fail with "device kernel image is invalid": the build adds
+  "companion" architectures (gfx1035, gfx1036, gfx1037, gfx1103, gfx115x; `cmake/hip_backend.cmake`, setup passes the
+  ones `hipInfo` lists).  The engine never runs on them.
+- **Visual Studio 2026's STL.**  MSVC 14.51 declares constexpr `isless`/`isgreater`/... that clang's HIP math wrapper
+  re-declares as `__device__`, which stops every HIP compile.  `cmake/hip_backend.cmake` writes a copy of `<cmath>`
+  without them into the build folder and puts it first on the HIP include path (the Visual Studio install is not
+  touched).
+- **Graph launch and scratch memory (the hang).**  Windows' HIP runtime keeps one scratch (private memory) buffer per
+  stream and grows it when a kernel needs more per-thread scratch than it was sized for, by waiting for every command
+  already queued on that stream.  The engine's verify-window graph starts with kernels that spin on a host flag
+  and contains later kernels that need more scratch, so `hipGraphLaunch` waited for a spin that only the launching
+  thread could end: the GPU spun until Windows reset the driver ("AMD software detected that a driver timeout has
+  occurred", the screen frozen meanwhile).  `hip_compat/cuda_runtime.h` now runs one trivial kernel needing
+  `STRATA_SCRATCH_WARM_BYTES` (default 512; the engine's largest is 424) bytes of scratch per thread on every stream
+  as it is created, so the buffer has its final size before any spin kernel exists (42.6 MiB of VRAM per stream; 0
+  turns it off).  Reproduced and verified with a graph of one capped spin kernel followed by ordinary ones:
+  `hipGraphLaunch` blocked for the whole spin without the warm-up and returned in 0.1 ms with it.
+- **Bounded spins.**  On Windows the three kernels that wait for the host (`doorbell_wait`, `wait_flag_ge`,
+  `wait_flag_ge_or`) give up after 1.2 s (`STRATA_SPIN_WHILE`, `kernels/dp4a.hpp`): a dispatch that runs longer than
+  ~2 s makes the driver reset the GPU, so a missed signal ends in a wrong answer and a live desktop, not a freeze.
+- **Command submission.**  The Windows HIP runtime holds a launched graph back until something flushes the queue (a
+  WDDM trait the engine's own decode loop already handles with one `cudaStreamQuery` after the launch).
+  `tests/hip/handoff.cpp` does the same on Windows.
+- **Pinned memory.**  Pinning the whole 35 GB expert arena (`cudaHostRegister`) succeeds but leaves the runtime unable
+  to finalize later command buffers ("PAL failed to finalize a command buffer", then "unspecified launch failure" at the
+  first copy): as with the multi-GPU Windows case in `generate.cpp`, Windows HIP pins at most 8 GiB
+  (`STRATA_PIN_LIMIT_GIB=<n>` overrides, 0 pins everything) and locks the rest in RAM with `VirtualLock`.
+- **No hipBLASLt.**  TheRock has no hipBLASLt kernels for gfx103X, so the build turns it off
+  (`-DCMAKE_DISABLE_FIND_PACKAGE_hipblaslt=ON`): the prompt's dense matrix products use plain hipBLAS.
+
+Validated on one machine (RX 6950 XT 16 GB, Ryzen 9 9950X with its integrated Radeon, 62 GB RAM, Windows 11, ROCm
+7.13.0a20260421, Visual Studio 2026 Build Tools): the engine builds through `START-HERE.bat --backend hip`, 30 of the
+32 GPU/CPU tests passed on the first run (the other two: `hip_handoff`, since given the Windows flush above and not
+re-run, and `ple_parity`, which needs the model), and the IQ2_XS model loads (33 GiB of experts in RAM, 10.4 GiB of
+them cached in VRAM, 475 MiB of VRAM left), reads a prompt and generates text with speculative decoding.  Not done:
+speed measurements, long contexts, images, the MMQ prompt path (`STRATA_PREFILL_MMQ`, used by the Linux build), other
+RDNA2 cards.  The Windows page file of this PC was 3.9 GB; setup warns about it (issue #60).
 
 ## Tuning table
 

@@ -40,3 +40,15 @@ __device__ __forceinline__ void strata_spin_pause() {
     __nanosleep(100);
 #endif
 }
+
+/// `while (cond) strata_spin_pause();` for the kernels that wait for the HOST (a doorbell flag in mapped memory).
+/// On Windows HIP a dispatch that runs longer than ~2 s makes the driver reset the GPU ("driver timeout": the screen
+/// freezes until it recovers), so a wait whose host never answers - a deadlock, a host stalled by something else -
+/// gives up after 1.2 s instead and lets the kernel end (the window's answer is then wrong, but the GPU and the
+/// desktop live; the host's own timeouts report the failure).  Elsewhere the wait is unbounded, as on CUDA.
+#if defined(__HIPCC__) && defined(_WIN32)
+#define STRATA_SPIN_LIMIT_TICKS 120000000ull   // wall_clock64 runs at a constant 100 MHz on gfx10/11/12
+#define STRATA_SPIN_WHILE(cond)                                                                                      do {                                                                                                                 const unsigned long long strata_spin_t0_ = wall_clock64();                                                       while (cond) {                                                                                                       strata_spin_pause();                                                                                             if (wall_clock64() - strata_spin_t0_ > STRATA_SPIN_LIMIT_TICKS) break;                                       }                                                                                                            } while (0)
+#else
+#define STRATA_SPIN_WHILE(cond) while (cond) strata_spin_pause()
+#endif

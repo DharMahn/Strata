@@ -424,7 +424,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) strata_spin_pause();
+    STRATA_SPIN_WHILE(*flag < value);
     __threadfence_system();
 }
 }  // namespace
@@ -471,9 +471,48 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     __threadfence();
     *skip = ring;
 }
+// The VRAM part of a layer's plan, built on the device whatever the misses (STRATA_VERIFY_DEVICE_PLAN=2): the groups
+// of the RESIDENT distinct experts, in routing order, each with its entries in order - exactly the VRAM groups the
+// host's `expert_pool_dispatch_multi` publishes, so the GPU starts its experts without waiting for that plan.  No
+// PCIe groups (the mode requires --pcie-frac 0).  One thread: at most kVerifyMaxT * 10 entries.
+__global__ void resident_plan_partial_kernel(const int32_t* __restrict__ ids, int n, int k,
+                                             const int32_t* __restrict__ res, int n_expert, const uint8_t* cache_base,
+                                             const unsigned long long* slot_off, long long blob,
+                                             int32_t* __restrict__ pl, long long capx) {
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    int groups = 0, entries = 0;
+    for (int i0 = 0; i0 < n; ++i0) {
+        bool first = true;
+        for (int j = 0; j < i0; ++j) if (ids[j] == ids[i0]) { first = false; break; }
+        if (!first) continue;
+        const int32_t e = ids[i0];
+        if (e < 0 || e >= n_expert || res[e] < 0) continue;   // a miss: the CPU's
+        const int32_t slot = res[e];
+        ptr[groups] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        start[groups] = entries;
+        for (int i = i0; i < n; ++i)
+            if (ids[i] == e) {
+                dst[entries] = i;
+                tok[entries] = i / k;
+                ++entries;
+            }
+        ++groups;
+    }
+    start[groups] = entries;
+    start2[0] = entries;
+    counts[0] = groups;
+    counts[1] = entries;
+    counts[2] = 0;
+}
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
-    while (*flag < value) strata_spin_pause();
+    STRATA_SPIN_WHILE(*flag < value);
     __threadfence_system();
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
@@ -495,6 +534,13 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
                                                              blob, plan, capx, skip, ring);
     check("resident_plan");
+}
+void resident_plan_partial(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                           const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                           long long capx, void* stream) {
+    resident_plan_partial_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base,
+                                                                     slot_off, blob, plan, capx);
+    check("resident_plan_partial");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);

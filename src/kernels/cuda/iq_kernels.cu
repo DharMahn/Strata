@@ -14,6 +14,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -40,6 +41,17 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 }
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
     const uint32_t* table32 = (const uint32_t*) table;
+#if defined(__HIP_PLATFORM_AMD__) && __has_builtin(__builtin_amdgcn_perm)
+    // llama.cpp's HIP form: one v_perm_b32 per table half, the nibble's top bit picks the half (bit-identical to the
+    // __byte_perm form below; see native_mmvq.cu iq4_table_lookup)
+    const uint32_t qe = (uint32_t) q4, qo = (uint32_t) q4 >> 4;
+    const uint32_t el = __builtin_amdgcn_perm(table32[1], table32[0], qe & 0x07070707u);
+    const uint32_t ol = __builtin_amdgcn_perm(table32[1], table32[0], qo & 0x07070707u);
+    const uint32_t eh = __builtin_amdgcn_perm(table32[3], table32[2], qe & 0x07070707u);
+    const uint32_t oh = __builtin_amdgcn_perm(table32[3], table32[2], qo & 0x07070707u);
+    return make_int2((int) __builtin_amdgcn_perm(eh, el, 0x03020100u | ((qe & 0x08080808u) >> 1)),
+                     (int) __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((qo & 0x08080808u) >> 1)));
+#endif
     uint32_t tmp[2];
     const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
 #pragma unroll
@@ -356,20 +368,23 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
                                                         const int32_t* __restrict__ ent_tok,
                                                         const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                         float* __restrict__ gate, float* __restrict__ up) {
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
+    // grid.y may be smaller than the group count: each block row walks groups blockIdx.y, + gridDim.y, ... (the
+    // arithmetic of a (group, row) is the same either way)
+    const int ng = *n_groups;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
     if (row >= 2 * L.n_ff) return;
     const bool is_up = row >= L.n_ff;
     const int r = is_up ? row - (int) L.n_ff : row;
-    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-    const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
-    for (int e = e0; e < e1; ++e) {
-        const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
-        if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+            if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
+        }
     }
 }
 
@@ -388,18 +403,19 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
                                                           const int32_t* __restrict__ ent_dst,
                                                           const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                           float* __restrict__ out) {
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
+    const int ng = *n_groups;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = blockIdx.x * 8 + warp;
     if (r >= L.n_embd) return;
-    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-    const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
-    for (int e = e0; e < e1; ++e) {
-        const float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane);
-        if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {   // see native_gu_kernel
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane);
+            if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s;
+        }
     }
 }
 
@@ -719,7 +735,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
-    const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
+    // The group count is on the device (a captured graph's grid is fixed), so the grid used to be cap_groups high
+    // (window tokens x 10) with most block rows exiting at once - ~3/4 of them on a 2-3 token window.  A fixed
+    // height whose rows loop over the groups launches far fewer empty blocks; the arithmetic is unchanged.
+    // STRATA_HITS_GY=N: grid height (0 = cap_groups, the old launch); default 0 - 16 measured within noise on the
+    // RX 6950 XT (tuning/results/opts-gy16: 63.2 vs 62.6 t/s short, 61.6 vs 63.6 long).
+    static const int64_t gy_env = [] {
+        const char* v = std::getenv("STRATA_HITS_GY");
+        return v != nullptr ? (int64_t) std::atoi(v) : (int64_t) 0;
+    }();
+    const int64_t gy = gy_env > 0 ? std::min<int64_t>(cap_groups, gy_env) : cap_groups;
+    const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
     switch (L.gu_type) {
         case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -735,7 +761,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const long long nh = (long long) cap_entries * L.n_ff;
     swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
     quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
-    const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
+    const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) gy);
     switch (L.d_type) {
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

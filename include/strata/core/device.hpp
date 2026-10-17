@@ -38,6 +38,13 @@ std::string gpu_arch_problem(int ordinal);
 // The GPU architectures this binary was compiled for ("gfx1100,gfx1201"); "" on CUDA builds.
 const char* compiled_gpu_archs();
 
+// HIP builds: check that logical GPU 0 - the first GPU this binary can run on, see hip_compat/cuda_runtime.h (a PC
+// with a CPU-integrated Radeon lists that first, and on Windows HIP_VISIBLE_DEVICES cannot hide it) - is usable,
+// make it the calling thread's device and return 0.  -1 (and `err`) when no device can run this binary.  The
+// other threads that use the GPU start on logical 0 the first time they ask cudaGetDevice.  CUDA builds: 0.
+int select_primary_gpu(std::string& err);
+int primary_gpu();
+
 // Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
 // run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
 // this is the matching check at run time (a binary can be carried to a different machine).

@@ -125,7 +125,7 @@ Verifier::~Verifier() {
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+                     h_flagA_, h_plan_, h_flagB_, h_flagP_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -133,6 +133,10 @@ Verifier::~Verifier() {
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
+    {
+        const char* v = std::getenv("STRATA_PLE_ASYNC");   // default on (tuning/LOG.md o3-ple); 0 = before the launch
+        ple_async_ = v == nullptr || std::atoi(v) != 0;
+    }
     diag_verify_fn().store(&diag_active_verifier);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     wt_ = &wt;
@@ -200,6 +204,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
+              mapped(64, (void**) &h_flagP_, (void**) &m_flagP_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
@@ -290,8 +295,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
+        // default 2 (every layer; tuning/LOG.md o3-dplan, g4-all); 1 = only all-resident layers, 0 = off
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        device_plan_ = v != nullptr && std::atoi(v) != 0;
+        const int mode = v != nullptr ? std::atoi(v) : 2;
+        device_plan_ = mode != 0;
+        device_plan_all_ = mode == 2;
     }
     if (device_plan_) {
         bool ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -302,6 +310,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); device_plan_ = false; }
     }
+    if (!device_plan_) device_plan_all_ = false;
+    if (device_plan_all_) std::fprintf(stderr, "strata verify: every layer's VRAM experts planned on the device\n");
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
     return true;
@@ -348,7 +358,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
-    if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    // the async path copies the rows just before layer 1's PLE block (below), once flag P says they are there
+    const bool ple_late = ple_on && ple_async_ && lb_ == 0;
+    if (ple_on && !ple_late) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    bool ple_copied = false;
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
@@ -406,6 +419,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // already applied it)
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
+            if (ple_late && !ple_copied) {
+                wait_flag_ge(m_flagP_, 1, cs);
+                copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+                ple_copied = true;
+            }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
             for (int t = tb; t < te; ++t) {
                 gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
@@ -617,13 +635,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+        if (device_plan_all_) {}   // every layer: its VRAM plan is made right after the doorbell (below)
+        else if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
         doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                          m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        // every layer's VRAM groups planned on the device (the host's plan is not waited for).  After the doorbell:
+        // the plan is a single-thread kernel that only the grouped VRAM call below reads, so the CPU's experts need
+        // not wait for it (decode review, tuning/decode-review-2026-10-02.md item 4)
+        if (device_plan_all_)
+            resident_plan_partial(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                                  hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                                  plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, cs);
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -661,7 +687,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-        if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+        if (device_plan_all_) {
+            // the plan is the device's own (pre): nothing to wait for
+        } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
         } else {
@@ -694,7 +722,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+        if (device_plan_all_) {}                               // no PCIe share in this mode
+        else if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
         else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
         if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
             const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
@@ -703,9 +732,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
         }
         stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2);
+        if (!device_plan_all_) grouped(p_ptr2, p_start2, p_counts + 2);   // the device's plan has no PCIe share: skipped
         stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+        if (device_plan_all_) {   // the CPU's rows as usual; the GPU's own rows are this plan's
+            wait_flag_ge(m_flag_, ring, cs);
+            stamp(l, 23, grp);
+            copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                                  p_dst, p_counts + 1, cs);
+        } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
@@ -868,6 +902,15 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "\n");
     }
 #endif
+    // debug (the "!!!" hunt): the captured graph's shape - a capture that another thread's HIP call disturbed would
+    // differ from the same window's graph in another start
+    size_t dbg_nodes = 0, dbg_edges = 0, dbg_roots = 0;
+#if defined(STRATA_USE_HIP)
+    (void) hipGraphGetNodes(graph, nullptr, &dbg_nodes);
+    (void) hipGraphGetEdges(graph, nullptr, nullptr, &dbg_edges);
+    (void) hipGraphGetRootNodes(graph, nullptr, &dbg_roots);
+    (void) cudaGetLastError();
+#endif
     const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
@@ -876,8 +919,8 @@ bool Verifier::capture(int T, std::string& err) {
     }
     const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
-    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s; %zu nodes, %zu edges, %zu roots)\n",
+                 T, cudaGetErrorString(ue), cudaGetErrorString(us), dbg_nodes, dbg_edges, dbg_roots);
     return true;
 }
 
@@ -968,6 +1011,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) (pos0 + t);
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) (pos0 + t);
     }
+    bool ple_wait = false;
+    std::string ple_err;
     if (ss.ple.ready() && ple_stage()) {
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
@@ -976,8 +1021,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             prev[0] = prev[1];
             prev[1] = tokens[t];
         }
-        if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
+        if (ple_async_ && lb_ == 0) {
+            if (!ss.ple.table->issue_batch(rows, (size_t) T)) { err = "verify: a PLE batch is already in flight"; return false; }
+            ple_wait = true;
+        } else {
+            const Clock::time_point tp = Clock::now();
+            if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
+            ms_ple += ms_since(tp);
+        }
     }
+    *(volatile uint32_t*) h_flagP_ = ple_wait ? 0u : 1u;   // a graph captured with the wait finds it raised otherwise
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
@@ -1025,9 +1078,33 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
+        // debug (STRATA_DBG_NAN, the "!!!" hunt): where a window's NaN is born - the MoE input the GPU hands the host at
+        // each layer's doorbell (mapped memory: what the device wrote, no copy in between), then what the CPU experts
+        // return.  The first three findings of the process are reported.
+        static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
+        static int dbg_nan_left = 3;
+        auto dbg_scan = [&](const float* p, size_t count, const char* what) {
+            if (!dbg_nan || dbg_nan_left <= 0) return;
+            size_t bad = 0, first = 0;
+            float mx = 0.0f;
+            for (size_t i = 0; i < count; ++i) {
+                const float v = ((const volatile float*) p)[i];
+                if (!std::isfinite(v)) { if (bad++ == 0) first = i; }
+                else mx = std::max(mx, std::fabs(v));
+            }
+            if (bad == 0) return;
+            --dbg_nan_left;
+            std::fprintf(stderr, "strata dbg: window at %lld (T %d): layer %lld group %d: %s has %zu of %zu non-finite values, "
+                                 "the first at %zu (row %zu); max finite |x| %.3g; ids of row 0:", (long long) pos0, T,
+                         (long long) l, grp, what, bad, count, first, first / (size_t) g.n_embd, (double) mx);
+            for (int64_t i = 0; i < ss.k; ++i) std::fprintf(stderr, " %d", (int) h_ids_[(size_t) tb * ss.k + i]);
+            std::fprintf(stderr, "\n");
+        };
+        dbg_scan(h_x_ + (size_t) tb * g.n_embd, (size_t) n * g.n_embd, "the MoE input x");
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        dbg_scan(h_ymiss_ + (size_t) tb * ss.k * g.n_embd, (size_t) n * ss.k * g.n_embd, "the CPU experts' y_miss");
         VDBG("layer %lld served\n", (long long) l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1043,12 +1120,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             raise_flag(h_flagB_, want);
         }
         *flag = want;
+        if (ple_wait && k == 0) {   // layer 0 (its first group) served: now the rows layer 1 needs
+            const Clock::time_point tp = Clock::now();
+            if (!ss.ple.table->collect_batch(h_ple_, ple_err))
+                std::memset(h_ple_, 0, (size_t) T * (size_t) g.n_embd * sizeof(float));   // the GPU must not wait forever
+            ms_ple += ms_since(tp);
+            ple_wait = false;
+            _mm_sfence();
+            *(volatile uint32_t*) h_flagP_ = 1u;
+        }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (!ple_err.empty()) { err = "verify: PLE rows: " + ple_err; return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
@@ -1170,6 +1257,13 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
+bool Verifier::finish(std::string& err) {
+    const OnDevice on_device(device_);
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    return next_ == nullptr || next_->finish(err);
+}
+
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
@@ -1180,8 +1274,21 @@ bool Verifier::commit(int n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    // STRATA_ASYNC_COMMIT=1: do not wait for the commit here.  Nothing the host does next needs it: the draft layer
+    // runs on its own stream from the window's residual (not from what the commit writes), the next window is launched
+    // on this stream after it, and its staging writes only the window's own mapped inputs (the commit reads
+    // m_commit_ at its start).  The commit's ~150 small kernels then overlap the draft instead of preceding it.  An
+    // error surfaces at the next window's synchronization.  (Windows: one query submits the graph now.)
+    static const bool async_commit = [] {
+        const char* v = std::getenv("STRATA_ASYNC_COMMIT");   // default on (tuning/LOG.md opts-async); 0 = sync
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (async_commit) {
+        (void) cudaStreamQuery(cs_);
+    } else {
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    }
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];

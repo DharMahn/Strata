@@ -3,7 +3,9 @@
 // Every projection of a chunk of T tokens is Y[T, N] = X[T, K] . W[N, K]^T with W row-major (the GGUF / pack layout)
 // and FP32 outputs.  Weights are BF16 on the device - either already (the pack's BF16 tensors) or dequantized from
 // their native GGUF blocks into a reusable scratch (`dequant_bf16`) right before the product - and activations are
-// rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
+// rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.  On RDNA2
+// (no tuned BF16/FP16->FP32 kernels in rocBLAS) the inputs are widened to FP32 in tiles of the scratch and multiplied
+// by the tuned SGEMM (gemm.cu, widen_route).
 #pragma once
 
 #include <cstddef>
@@ -45,6 +47,9 @@ public:
     void* stream() const { return stream_; }
 
 private:
+    bool widened(const uint16_t* X, const uint16_t* W, bool bf, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                 float beta, float* ws, int64_t ws_floats);
+
     void* handle_ = nullptr;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;

@@ -1172,6 +1172,49 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
+    // debug (STRATA_DBG_NAN, the "!!!" hunt): a window's non-finite expert rows - whose they are (the CPU's or a row the
+    // GPU fills), and whether the same CPU jobs come out finite when they are simply run again
+    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
+        static int left = 2;
+        auto bad_row = [&](int64_t i) {
+            const volatile float* row = out + (size_t) i * H;
+            for (int64_t c = 0; c < H; ++c)
+                if (!std::isfinite(row[c])) return true;
+            return false;
+        };
+        int nbad = 0;
+        for (int64_t i = 0; i < n && left > 0; ++i) nbad += bad_row(i);
+        if (nbad > 0 && left > 0) {
+            --left;
+            std::fprintf(stderr, "strata dbg: layer %lld: %d of %lld expert rows non-finite after the CPU pool (%d jobs):",
+                         (long long) d.layers, nbad, (long long) n, njobs);
+            for (int64_t i = 0; i < n; ++i)
+                if (bad_row(i)) {
+                    const int32_t e = ids[i];
+                    const int jo = d.job_of[(size_t) e];
+                    std::fprintf(stderr, " [row %lld tok %lld expert %d kind %d job %d nt %d blob %p fnv %016llx]", (long long) i,
+                                 (long long) (i / k), (int) e, (int) kind[i], jo, jo >= 0 ? d.jobs_multi[(size_t) jo].nt : 0,
+                                 jo >= 0 ? (const void*) d.jobs_multi[(size_t) jo].blob : nullptr,
+                                 jo >= 0 ? (unsigned long long) fnv1a64(d.jobs_multi[(size_t) jo].blob,
+                                                                        lay.blob_bytes(d.layers), 1469598103934665603ull) : 0ull);
+                }
+            std::fprintf(stderr, "\n");
+            if (native && njobs > 0) {
+                d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+                int again = 0;
+                for (int64_t i = 0; i < n; ++i) again += kind[i] < 0 && bad_row(i);
+                std::fprintf(stderr, "strata dbg: layer %lld: the same %d CPU jobs run again: %d CPU rows non-finite;", (long long) d.layers,
+                             njobs, again);
+                for (int64_t i = 0; i < n; ++i)
+                    if (kind[i] < 0 && d.job_of[(size_t) ids[i]] >= 0 && i == (int64_t) (d.jobs_multi[(size_t) d.job_of[(size_t) ids[i]]].out[0] - out) / H)
+                        std::fprintf(stderr, " %d:%016llx", (int) ids[i],
+                                     (unsigned long long) fnv1a64(d.jobs_multi[(size_t) d.job_of[(size_t) ids[i]]].blob,
+                                                                  lay.blob_bytes(d.layers), 1469598103934665603ull));
+                std::fprintf(stderr, "\n");
+            }
+            std::fflush(stderr);
+        }
+    }
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
@@ -1556,6 +1599,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                 break;
             }
             dev_slice_.push_back((const uint8_t*) d);
+        }
+        if (std::getenv("STRATA_DBG_ARENA") != nullptr) {   // debug (the "!!!" hunt): where the arena and its aliases are
+            std::fprintf(stderr, "strata dbg: arena host %p..%p (%llu B), %llu B registered in %zu slices\n", (const void*) base_,
+                         (const void*) (base_ + a->capacity), (unsigned long long) a->capacity,
+                         (unsigned long long) a->registered_bytes, starts.size());
+            for (size_t i = 0; i < dev_slice_.size(); ++i)
+                std::fprintf(stderr, "strata dbg: arena slice %zu: host %p, device alias %p\n", i,
+                             (const void*) (base_ + starts[i]), (const void*) dev_slice_[i]);
         }
     }
     blobs_ = n_layers * n_expert;

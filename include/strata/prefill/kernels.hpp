@@ -59,6 +59,21 @@ void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void*
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
+/// debug (STRATA_DBG_STAGECHK): *out = an order-free checksum of the blob (the host's `blob_checksum_host` is equal)
+void blob_checksum(const uint8_t* p, int64_t bytes, unsigned* out, void* stream);
+inline unsigned blob_checksum_host(const uint8_t* p, int64_t bytes) {
+    unsigned h = 0;
+    const int64_t words = bytes / 4;
+    for (int64_t i = 0; i < words; ++i) {
+        uint32_t w;
+        __builtin_memcpy(&w, p + i * 4, 4);
+        h += (w ^ (uint32_t) i) * 2654435761u;
+    }
+    for (int64_t i = words * 4; i < bytes; ++i) h += ((unsigned) p[i] + 1u) * (unsigned) (i + 1);
+    return h;
+}
+/// debug (STRATA_DBG_NAN2): *out += the number of non-finite values in x[0, n); no host sync
+void count_nonfinite(const float* x, int64_t n, unsigned* out, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);

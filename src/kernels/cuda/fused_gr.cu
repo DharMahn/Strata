@@ -149,7 +149,13 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
 #pragma unroll
     for (int c = 0; c < HC; ++c) gw[c] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
     float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int i = t * 4; i < D; i += THREADS * 4) {
+    // r * w_norm stays in registers until rs is known, then is scaled and written once (it was written, read back
+    // and scaled in a second global pass: the same two roundings, bitwise the same xn)
+    constexpr int PER = D / (THREADS * 4);
+    float4 xr[PER];
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int i = t * 4 + k * THREADS * 4;
         const int c = i / N, d = i - c * N;
         float4 r = *reinterpret_cast<const float4*>(a.R + i);
         if (a.apply) {
@@ -161,7 +167,7 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
         float sq = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
 #pragma unroll
         for (int cc = 0; cc < HC; ++cc) if (cc == c) ss[cc] += sq;
-        *reinterpret_cast<float4*>(xn + i) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+        xr[k] = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
     }
 #pragma unroll
     for (int c = 0; c < HC; ++c) {
@@ -176,14 +182,19 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
         a.rs[t] = s_rs[t];
     }
     __syncthreads();
-    for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int i = t * 4 + k * THREADS * 4;
+        const float r = s_rs[i / N];
+        *reinterpret_cast<float4*>(xn + i) = make_float4(xr[k].x * r, xr[k].y * r, xr[k].z * r, xr[k].w * r);
+    }
 }
 
-#if defined(__HIPCC__)
-constexpr int TILE = 1280;             // eight-token tile fits RDNA3/RDNA4's 64 KiB LDS limit
-#else
-constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
-#endif
+// xn floats per token staged at a time: 320 chunks of 8, 10 per lane.  HIP used 1280 so that eight tokens fit the
+// 64 KiB LDS limit in one launch; but every tile is a serial DRAM round trip (load the weights, stage, compute), and
+// the decode windows here are at most 6 tokens, which 2560 still fits (the launch below slices larger ones).  Half the
+// tiles, the same chunks in the same order per lane: bitwise the same outputs.
+constexpr int TILE = 2560;
 constexpr int TQ = TILE / 8 / 32;      // uint4 weight chunks per lane per tile
 
 // Step 2 of `gr_down_kernel` for T tokens.  One warp per row (so each lane accumulates the same chunks in the

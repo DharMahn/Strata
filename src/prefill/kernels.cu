@@ -503,6 +503,29 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
+// debug (STRATA_DBG_STAGECHK): an order-free checksum of a blob's 32-bit words - *out = sum_i (w_i ^ i) * 2654435761,
+// plus the tail bytes as (b + 1) * (i + 1) - the host computes the same over the RAM copy (prefill.cpp)
+__global__ void blob_checksum_kernel(const uint8_t* __restrict__ p, int64_t bytes, unsigned* __restrict__ out) {
+    const int64_t words = bytes / 4;
+    const uint32_t* w = (const uint32_t*) p;
+    unsigned h = 0;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < words; i += (int64_t) gridDim.x * blockDim.x)
+        h += (w[i] ^ (uint32_t) i) * 2654435761u;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        for (int64_t i = words * 4; i < bytes; ++i) h += ((unsigned) p[i] + 1u) * (unsigned) (i + 1);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) h += (unsigned) __shfl_xor_sync(0xffffffffu, (int) h, o);
+    if ((threadIdx.x & 31) == 0) atomicAdd(out, h);
+}
+// debug (STRATA_DBG_NAN2): *out += the non-finite values of x[0, n), without a host sync
+__global__ void count_nonfinite_kernel(const float* __restrict__ x, int64_t n, unsigned* __restrict__ out) {
+    unsigned c = 0;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        c += (__float_as_uint(x[i]) & 0x7f800000u) == 0x7f800000u;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) c += (unsigned) __shfl_xor_sync(0xffffffffu, (int) c, o);
+    if ((threadIdx.x & 31) == 0 && c != 0) atomicAdd(out, c);
+}
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
@@ -750,6 +773,18 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     if (n <= 0) return;
     gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
+}
+void blob_checksum(const uint8_t* p, int64_t bytes, unsigned* out, void* stream) {
+    if (bytes <= 0 || p == nullptr) return;
+    cudaMemsetAsync(out, 0, sizeof(unsigned), (cudaStream_t) stream);
+    blob_checksum_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(p, bytes, out);
+    check("blob_checksum");
+}
+void count_nonfinite(const float* x, int64_t n, unsigned* out, void* stream) {
+    if (n <= 0 || x == nullptr) return;
+    const int64_t b = (n + 255) / 256;
+    count_nonfinite_kernel<<<(unsigned) (b < 1024 ? b : 1024), 256, 0, (cudaStream_t) stream>>>(x, n, out);
+    check("count_nonfinite");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {

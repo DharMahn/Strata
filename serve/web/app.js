@@ -461,7 +461,11 @@ function markdown(text) {
 }
 
 // ------------------------------------------------------------------ Chat
+// `prose` (the "Start thinking in prose" switch) has no default here: unset follows the server's config
+// (`sampling.strata_think_prefix`, see docs/THINK_PREFIX.md); only a choice made in the drawer is sent.
 const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+let serverProse = false;              // what the server's config does with `strata_think_prefix` (GET /settings)
+const proseOn = (s) => typeof s.prose === "boolean" ? s.prose : serverProse;
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
@@ -692,6 +696,9 @@ async function send() {
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
+  // the thinking starts "Let me think about this. The user" - sent only when the switch was set in the drawer;
+  // otherwise the server's config decides (it is off unless the config turns it on)
+  if (settings.thinking !== "none" && typeof settings.prose === "boolean") body.strata_think_prefix = settings.prose;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
@@ -890,6 +897,7 @@ function loadDrawer(s = settings) {
   $("s-max").value = s.max; $("s-seed").value = s.seed;
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
+  $("s-prose").setAttribute("aria-checked", String(proseOn(s)));
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   $("s-share").setAttribute("aria-checked", String(sharedOn));
@@ -900,9 +908,14 @@ let sharedOn = false;
 async function loadShared() {
   try {
     const r = await fetch("settings", {headers: headers()});
-    if (r.ok) sharedOn = !!(await r.json()).shared;
-  } catch (e) { /* an older server: the switch just stays off */ }
+    if (r.ok) {
+      const j = await r.json();
+      sharedOn = !!j.shared;
+      serverProse = !!(j.server_defaults && j.server_defaults.strata_think_prefix);
+    }
+  } catch (e) { /* an older server: the switches just stay off */ }
   $("s-share").setAttribute("aria-checked", String(sharedOn));
+  $("s-prose").setAttribute("aria-checked", String(proseOn(settings)));
 }
 function sharedDefaults(s) {
   const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
@@ -910,6 +923,7 @@ function sharedDefaults(s) {
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
+  if (typeof s.prose === "boolean") d.strata_think_prefix = s.prose;
   return d;
 }
 async function saveShared(on, s) {
@@ -940,6 +954,7 @@ for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $(
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
+$("s-prose").onclick = () => $("s-prose").setAttribute("aria-checked", String($("s-prose").getAttribute("aria-checked") !== "true"));
 $("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
 $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
@@ -950,6 +965,9 @@ $("s-apply").onclick = async () => {
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
+  // the prose switch is remembered only when it differs from the server's config default
+  const prose = $("s-prose").getAttribute("aria-checked") === "true";
+  if (prose !== serverProse) settings.prose = prose;
   store.set("sampling", settings);
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);

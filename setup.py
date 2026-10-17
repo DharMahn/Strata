@@ -520,14 +520,15 @@ def find_nvcc():
     return best
 
 
-def find_vcvars():
+def find_vcvars(any_version=False):
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
     # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
-    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none
-    p = out([str(vswhere), "-latest", "-products", "*", "-version", "[16.0,18.0)", "-requires",
-             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
+    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none.
+    # The HIP build (clang) takes any version (any_version): it needs only the C++ libraries and the Windows SDK.
+    p = out([str(vswhere), "-latest", "-products", "*", *([] if any_version else ["-version", "[16.0,18.0)"]),
+             "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
 
@@ -714,13 +715,25 @@ def cuda_lib_dirs():
 # (no sudo; a system ROCm 7 in /opt/rocm is used when it has hipcc and hipBLAS) and the engine is compiled here for
 # the card.  One GPU, no images yet.
 ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   # TheRock's wheels per GPU family
-                "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/"}
-ROCM_VERSION = os.environ.get("STRATA_ROCM_VERSION", "7.10.0a20251120")   # what Strata's HIP build was tested with
+                "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
+                "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-dgpu/",
+                "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-dgpu/"}   # RDNA2: one index for gfx1030/1031/1032/1034
+# what Strata's HIP build was tested with: 7.10 on Linux (gfx1100, gfx1201); the gfx103X index has Windows wheels
+# from 7.13 only, which is what the RX 6950 XT port was built and tested with
+ROCM_VERSION = os.environ.get("STRATA_ROCM_VERSION", "7.13.0a20260421" if WIN else "7.10.0a20251120")
 ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the wheels (gfx1201 needs ROCm 6.4 or newer)
-AMD_ARCHS = ("gfx1100", "gfx1201")
+AMD_ARCHS = ("gfx1100", "gfx1201", "gfx1030", "gfx1031")
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
-             "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)"}
-AMD_CARDS = "the RX 7900 XT / XTX (gfx1100) and the RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201)"
+             "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)",
+             "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)",
+             "gfx1031": "AMD Radeon RX 6700 XT (gfx1031)"}
+AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), the RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201) and, "
+             "on Windows, the RX 6800 / 6900 series (gfx1030) and RX 6700 XT (gfx1031, untested)")
+# Windows has no KFD topology: the AMD display adapters come from the registry and their PCI device id says which
+# chip they are.  Only the ids of chips Strata supports are listed; any other AMD adapter (the CPU's integrated
+# Radeon, an RX 6600, ...) is shown as not supported.  (id range, arch)
+AMD_PCI_ARCH = [((0x73A0, 0x73BF), "gfx1030"),     # Navi 21: RX 6800 / 6800 XT / 6900 XT / 6950 XT
+                ((0x73C0, 0x73DF), "gfx1031")]     # Navi 22: RX 6700 XT (0x73DF), 6800M; 12 GB, not yet run by the maintainers
 
 
 def rocm_index(arch):
@@ -730,9 +743,11 @@ def rocm_index(arch):
 def amd_gpus():
     """AMD GPUs from the kernel's KFD topology (the amdgpu driver; no ROCm needed), numbered as HIP numbers them:
     the GPU nodes in order, the CPU nodes skipped.  Integrated GPUs are listed too (not supported)."""
+    if WIN:
+        return amd_gpus_windows()
     base = Path("/sys/class/kfd/kfd/topology/nodes")
     found = []
-    if WIN or not base.is_dir():
+    if not base.is_dir():
         return found
     for node in sorted((p for p in base.iterdir() if p.name.isdigit()), key=lambda p: int(p.name)):
         try:
@@ -762,6 +777,43 @@ def amd_gpus():
     return found
 
 
+def amd_gpus_windows():
+    """The AMD display adapters of a Windows PC, from the registry (the driver's class key): name, VRAM and, for the
+    chips Strata supports, the GPU architecture.  Integrated Radeons are listed too (arch "unknown": not supported)."""
+    import winreg
+    cls = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    found = []
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, cls)
+    except OSError:
+        return found
+    with root:
+        for i in range(64):
+            try:
+                key = winreg.OpenKey(root, f"{i:04d}")
+            except OSError:
+                continue
+            with key:
+                def val(name):
+                    try:
+                        return winreg.QueryValueEx(key, name)[0]
+                    except OSError:
+                        return None
+                ids = str(val("MatchingDeviceId") or "").lower()
+                m = re.search(r"ven_1002&dev_([0-9a-f]{4})", ids)
+                if not m:
+                    continue
+                dev = int(m.group(1), 16)
+                mem = val("HardwareInformation.qwMemorySize")
+                if isinstance(mem, bytes):
+                    mem = int.from_bytes(mem[:8], "little")
+                arch = next((a for (lo, hi), a in AMD_PCI_ARCH if lo <= dev <= hi), "unknown")
+                found.append({"index": len(found), "name": str(val("DriverDesc") or "AMD Radeon"),
+                              "vram_gb": (mem or 0) / 2 ** 30, "arch": arch, "driver": str(val("DriverVersion") or ""),
+                              "vendor": "amd"})
+    return found
+
+
 def amd_problem(g):
     if g["arch"] not in AMD_ARCHS:
         return f"not supported - Strata's AMD backend runs on {AMD_CARDS} only, this is {g['arch']}"
@@ -777,9 +829,52 @@ def rocm_version(root):
         return None
 
 
+def rocm_root_windows(arch):
+    """ROCm for compiling and running the HIP engine on Windows: AMD's TheRock wheels (ROCM_VERSION, from the card
+    family's index) installed into .venv, no admin rights.  Returns (root, [its bin folder]): the HIP runtime,
+    hipBLAS and rocBLAS DLLs (with the rocBLAS kernels for the card) are all in there."""
+    index = rocm_index(arch)
+    sdk = Path(sys.executable).parent / "rocm-sdk.exe"
+    stamp = Path(sys.prefix) / ".strata-rocm.json"
+    have = json.loads(stamp.read_text()) if stamp.exists() else {}
+    if have.get("version") != ROCM_VERSION or have.get("index") != index or not sdk.exists():
+        say(f"  Installing ROCm {ROCM_VERSION} for AMD GPUs into .venv (AMD's TheRock wheels, ~2.7 GB, no admin) ...")
+        pip = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--index-url", index]
+        if have.get("version") == ROCM_VERSION:        # the same version for another GPU family: its own libraries
+            run(pip + ["--force-reinstall", "--no-deps", f"rocm=={ROCM_VERSION}"])
+        run(pip + [f"rocm[libraries,devel]=={ROCM_VERSION}"])
+        stamp.write_text(json.dumps({"version": ROCM_VERSION, "index": index}))
+    out([str(sdk), "init"])                            # expands the compiler, headers and libraries ("devel") once
+    root = Path(out([str(sdk), "path", "--root"]).strip())
+    if not (root / "lib" / "llvm" / "bin" / "clang++.exe").exists():
+        fail(f"ROCm was installed but its compiler is missing ({root})", f"remove {stamp} and run this again")
+    ok(f"ROCm: {root}")
+    return root, [str(root / "bin")]
+
+
+def hip_device_archs(root):
+    """The GPU architectures the HIP runtime lists on this PC, in HIP's order (hipInfo); [] when it cannot tell."""
+    exe = next(iter(sorted(Path(root, "bin").glob("hipInfo*.exe"))), None)
+    if exe is None:
+        return []
+    env = {**os.environ, "PATH": os.pathsep.join([str(Path(root, "bin")), os.environ.get("PATH", "")])}
+    try:
+        text = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120, env=env).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [m.group(1) for m in re.finditer(r"gcnArchName:\s*(gfx[0-9a-f]+)", text)]
+
+
+# CPU-integrated Radeons (Ryzen 7000 / 9000 desktop: gfx1036): Windows' HIP runtime lists one as device 0 and loads
+# a code object for EVERY device it lists, so the engine carries code for them too (and never runs on them)
+HIP_COMPANION_ARCHS = ("gfx1035", "gfx1036", "gfx1037", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153")
+
+
 def rocm_root(arch):
     """ROCm for compiling and running the HIP engine for `arch`: (root, library folders).  A system ROCm 7 with hipcc
     and hipBLAS, else AMD's TheRock wheels (ROCM_VERSION, from the card family's index) installed into .venv."""
+    if WIN:
+        return rocm_root_windows(arch)
     sysroot = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
     if (sysroot / "bin" / "hipcc").exists() and list((sysroot / "lib").glob("libhipblas.so*")):
         ver = rocm_version(sysroot)
@@ -846,7 +941,7 @@ def hipblaslt_table(arch, lib_dirs):
     return None
 
 
-def build_engine_hip(gpu, llama) -> Path:
+def build_engine_hip(gpu, llama, yes=False) -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`)."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
@@ -856,27 +951,56 @@ def build_engine_hip(gpu, llama) -> Path:
     if meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and             gpu["arch"] in meta.get("archs", []):
         ok("engine already built for this PC")
         return eng
-    if not (shutil.which("c++") or shutil.which("g++")) or not shutil.which("git"):
+    vcvars = None
+    if WIN:
+        vcvars = find_vcvars(any_version=True)
+        if vcvars is None:
+            install_vs_build_tools(yes)
+            vcvars = find_vcvars(any_version=True)
+            if vcvars is None:
+                fail("the C++ build tools did not install", "install Visual Studio Build Tools (C++) and run it again")
+    elif not (shutil.which("c++") or shutil.which("g++")) or not shutil.which("git"):
         fail("a C++ compiler and git are needed to compile the AMD engine",
              "Ubuntu/Debian: sudo apt install build-essential git   Fedora: sudo dnf install gcc-c++ git")
     root, dirs = rocm_root(gpu["arch"])
+    llvm_bin = root / "lib" / "llvm" / "bin" if WIN else root / "llvm" / "bin"
     libs = [str(Path(d).parent) for d in dirs[1:]]
     bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode") if p.is_dir()),
                    root / "amdgcn" / "bitcode")
     os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root),
                        "HIP_PATH": str(root)})
-    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
-    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+    if not WIN:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(llvm_bin), os.environ.get("PATH", "")])
+    archs = [gpu["arch"]]
+    defs = ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF"]
+    fwd = lambda p: str(p).replace("\\", "/")          # noqa: E731 - CMake wants forward slashes in these values
+    if WIN:
+        # the other GPUs the HIP runtime lists (the CPU's integrated Radeon) get code too: see HIP_COMPANION_ARCHS
+        others = sorted({a for a in hip_device_archs(root) if a != gpu["arch"]})
+        companion = [a for a in others if a in HIP_COMPANION_ARCHS]
+        if set(others) - set(companion):
+            warn("the HIP runtime lists GPUs this engine has no code for (" + ", ".join(sorted(set(others) - set(companion)))
+                 + "): starting may fail with 'device kernel image is invalid' unless they are disabled")
+        archs += companion
+        defs += [f"-DCMAKE_C_COMPILER={fwd(llvm_bin / 'clang.exe')}", f"-DCMAKE_CXX_COMPILER={fwd(llvm_bin / 'clang++.exe')}",
+                 f"-DCMAKE_HIP_COMPILER={fwd(llvm_bin / 'clang++.exe')}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={fwd(root)}",
+                 f"-DCMAKE_PREFIX_PATH={fwd(root)}",
+                 f"-DCMAKE_HIP_FLAGS=--rocm-path={fwd(root)} --rocm-device-lib-path={fwd(bitcode)}",
+                 "-DCMAKE_DISABLE_FIND_PACKAGE_hipblaslt=ON",    # no hipBLASLt kernels for RDNA2: plain hipBLAS
+                 # llama.cpp's MMQ for the prompt's experts, as the Linux build: 8K prompt 323 -> 404 tokens/s on the
+                 # RX 6950 XT (tuning/LOG.md); STRATA_PREFILL_MMQ=0 at run time keeps the FP16 path
+                 "-DSTRATA_PREFILL_MMQ=ON"]
+    else:
+        defs += ["-DSTRATA_PREFILL_MMQ=ON", f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+                 f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}", "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
+                 f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"]
     say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
         if meta.get("backend") == "hip" and (eng / EXE).exists() and gpu["arch"] in meta.get("archs", [])
         else "  Compiling the Strata engine for your AMD GPU (10-20 minutes, once) ...")
     cmake_build(ROOT, ROOT / "build-hip", "strata",
-                ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
-                 "-DSTRATA_PREFILL_MMQ=ON", f"-DCMAKE_HIP_ARCHITECTURES={gpu['arch']}",
-                 f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
-                 "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
-                 f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
-                 f"-DSTRATA_GGML_DIR={llama}"], None, "")
+                defs + [f"-DCMAKE_HIP_ARCHITECTURES={';'.join(archs)}", f"-DSTRATA_GGML_DIR={fwd(llama) if WIN else llama}"],
+                vcvars, "build-strata-hip.bat")
     shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
     stamp.write_text(json.dumps({"source": "local-hip", "backend": "hip", "version": source_version(),
                                  "archs": [gpu["arch"]], "vision": "none", "lib_dirs": dirs, "src": src}, indent=1))
@@ -1092,6 +1216,22 @@ def install_build_tools(gpu, yes):
         fail("the CUDA Toolkit did not install", "install it from https://developer.nvidia.com/cuda-downloads, then run it again")
     ok(f"build tools installed (CUDA {cuda_v[0]}.{cuda_v[1]})")
     return nvcc, find_vcvars() if WIN else None
+
+
+def install_vs_build_tools(yes):
+    """Visual Studio Build Tools (C++) for the AMD engine's compile on Windows: the HIP compiler is clang, which
+    needs the C++ libraries and the Windows SDK that come with it (asks once)."""
+    say("  The engine has to be compiled for your PC, which needs: Visual Studio Build Tools (C++).")
+    say("  They can be installed now (about 6 GB, 10-30 minutes, Windows will ask for permission).")
+    if ask("  Install them now?", ["y", "n"], "y", yes) != "y":
+        fail("the build tools are needed", "install them yourself (README.md) and run it again")
+    if shutil.which("winget") is None:
+        fail("winget (Windows package manager) is not available",
+             "install 'App Installer' from the Microsoft Store, or install the tools by hand (README.md)")
+    run(["winget", "install", "-e", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements",
+         "--disable-interactivity", "--id", "Microsoft.VisualStudio.2022.BuildTools", "--override",
+         "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
+        check=False)
 
 
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
@@ -1767,8 +1907,12 @@ def main() -> int:
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--backend", choices=["cuda", "hip"],
-                    help="cuda = NVIDIA (default), hip = AMD RX 7900 XT/XTX or RX 9070 / AI PRO R9700 on Linux (experimental; chosen by itself "
+                    help="cuda = NVIDIA (default), hip = AMD RX 7900 XT/XTX or RX 9070 / AI PRO R9700 on Linux, RX 6800/6900 on Windows (experimental; chosen by itself "
                          "when the PC has no NVIDIA card Strata can use)")
+    ap.add_argument("--think-prefix", choices=["on", "off"],
+                    help="RDNA2 fork: write the thinking's first words (\"Let me think about this. The user\", and \"Let me\" after "
+                         "a tool result) for the Qwen3.8-Flash-Next model, as the run config's sampling block (docs/THINK_PREFIX.md). "
+                         "Off by default; this sets or removes the two keys and leaves the rest of the config's sampling block alone")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.gpu is not None:                              # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
@@ -1842,7 +1986,7 @@ def main() -> int:
     # ---- 1. the PC
     step(1, "checking your PC")
     found = gpus()
-    amd = [] if WIN else amd_gpus()
+    amd = amd_gpus()
     nv_ok = any(gpu_problem(g) is None for g in found)
     amd_ok = [g for g in amd if amd_problem(g) is None]
     hip = a.backend == "hip" or (a.backend is None and not nv_ok and bool(amd_ok))
@@ -1858,14 +2002,13 @@ def main() -> int:
         if a.check and not hip:
             say("  (the AMD card: ./setup.sh --backend hip)")
     if hip:                                            # AMD (experimental): one card, compiled here
-        if WIN:
-            fail("Strata's AMD backend runs on Linux only", "use an NVIDIA RTX 20 series or newer card on Windows")
-        say("  Your AMD GPUs:" if amd else "  No AMD GPU found (the amdgpu driver's KFD topology is empty).")
+        say("  Your AMD GPUs:" if amd else "  No AMD GPU found ("
+            + ("Windows lists no AMD display adapter)." if WIN else "the amdgpu driver's KFD topology is empty)."))
         for g in amd:
             say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + (amd_problem(g) or "can be used"))
         usable = [g for g in amd if amd_problem(g) is None]
         if not usable:
-            fail("no AMD GPU Strata can use", f"the AMD backend runs on {AMD_CARDS} on Linux")
+            fail("no AMD GPU Strata can use", f"the AMD backend runs on {AMD_CARDS}")
         if a.gpus:
             fail("several GPUs sharing one model: NVIDIA only for now", "use one AMD card (--gpu N)")
         if a.gpu is not None:
@@ -1882,7 +2025,7 @@ def main() -> int:
         if not found:
             fail("no NVIDIA GPU found (nvidia-smi did not answer)",
                  "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC"
-                 + ("; an AMD RX 7900 XT/XTX or RX 9070 / AI PRO R9700: --backend hip" if amd else ""))
+                 + ("; an AMD GPU Strata supports (experimental): --backend hip" if any(amd_problem(g) is None for g in amd) else ""))
         if len(found) > 1 or gpu_problem(found[0]) is not None:
             gpu_table(found)
         sel = choose_gpus(a, found)                    # asked when two or more cards can share the model
@@ -2128,7 +2271,7 @@ def main() -> int:
                 warn(f"the ready-made image encoder has no code for your GPU (sm_{gpu['arch']}): compiling it")
                 eng = None
     if eng is None:
-        eng = build_engine_hip(gpu, llama) if hip else build_engine(gpu, vision, a.yes, llama)
+        eng = build_engine_hip(gpu, llama, a.yes) if hip else build_engine(gpu, vision, a.yes, llama)
     meta = json.loads((eng / "BUILD.json").read_text())
     lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs()
     ok(f"engine: {eng / EXE}")
@@ -2254,7 +2397,7 @@ def main() -> int:
             cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
         if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
             cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
-    if gpu["count"] > 1 or a.gpu is not None:
+    if (gpu["count"] > 1 or a.gpu is not None) and not (hip and WIN):   # (Windows HIP: the engine picks its card itself)
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
         cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start
     if multi:                                          # a layer split across these cards (the server adds the flag)
@@ -2279,6 +2422,23 @@ def main() -> int:
         import calibrate as CAL
         cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
+    try:   # the earlier config's `sampling` block (the defaults every client gets) survives a new setup
+        old_sampling = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("sampling")
+        if isinstance(old_sampling, dict) and old_sampling and "sampling" not in cfg:
+            cfg["sampling"] = old_sampling
+            ok("the sampling defaults of the earlier config are kept: " +
+               ", ".join(f"{k}={v}" for k, v in old_sampling.items()))
+    except (OSError, ValueError):
+        pass
+    if a.think_prefix:      # docs/THINK_PREFIX.md: the same keys can be edited in the config by hand
+        sm = {k: v for k, v in (cfg.get("sampling") or {}).items() if k not in ("strata_think_prefix", "strata_think_prefix_tool")}
+        if a.think_prefix == "on":
+            sm.update({"strata_think_prefix": True, "strata_think_prefix_tool": True})
+        if sm:
+            cfg["sampling"] = sm
+        else:
+            cfg.pop("sampling", None)
+        ok(f"thinking opening: {a.think_prefix} (sampling.strata_think_prefix in {cfg_path.name})")
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     script = write_run_script(tag, cfg_path, port)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it

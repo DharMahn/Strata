@@ -12,7 +12,8 @@ namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
-/// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
+/// MMQ covers this ggml type (the i-quants and Q2_0 the packs use, Q8_0, and the K-quants of the GGUF's dense
+/// matrices; IQ1_M is not covered).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
@@ -59,6 +60,14 @@ private:
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream);
+/// Up to kGatherMax GGUF-native experts in one launch (`gather_native` per expert was ~30 us of launch and tail each,
+/// 24,000 times per 8K prompt): entry i's gate, up and down into its `slot` of the group buffers (`gu_stride` and
+/// `d_stride` apart).
+constexpr int kGatherMax = 16;
+struct GatherSrc { const void* gate; const void* up; const void* down; int slot; };   // slot: of the group buffers
+struct GatherBatch { GatherSrc e[kGatherMax]; };
+void gather_native_batch(const GatherBatch& b, int n, size_t gu_half_bytes, size_t d_bytes, void* gu_dst, size_t gu_stride,
+                         void* d_dst, size_t d_stride, void* stream);
 /// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
@@ -69,5 +78,10 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
+
+/// `quantize` for FP16 rows (no id map): the prompt path's dense projections take FP16 activations.
+void quantize_h(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
+/// b[0] = 0, b[1] = rows: the bounds of one "expert" covering every row (a dense matrix through MoE mode).
+void dense_bounds(int32_t* b, int64_t rows, void* stream);
 
 }  // namespace strata::prefill::mmq

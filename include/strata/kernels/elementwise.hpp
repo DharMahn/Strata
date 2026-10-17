@@ -117,4 +117,9 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 
+/// Diagnostic (STRATA_VRAM_PROBE): read `bytes` of device-addressable memory as fast as the GPU can, writing nothing
+/// unless an impossible sum turns up (`sink`, 4 bytes).  Timed with events it tells VRAM (hundreds of GB/s) from memory
+/// the driver has placed or paged into system RAM (the PCIe rate, ~25 GB/s).
+void read_probe(const void* p, uint64_t bytes, uint32_t* sink, void* stream);
+
 }  // namespace strata::kernels

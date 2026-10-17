@@ -1,0 +1,77 @@
+[
+ {
+  "name": "base",
+  "suite": "full",
+  "runs": 3,
+  "note": "reference: the run config as setup wrote it (run this first; every other entry is compared with it)",
+  "compare": "tuning/results/base"
+ },
+ {
+  "name": "workers8",
+  "suite": "quick",
+  "runs": 3,
+  "set": [
+   "--pool-workers=8"
+  ],
+  "compare": "tuning/results/base",
+  "note": "CPU expert threads; the 6950 XT was best at 12 (of 6/8/10/12/15) on a 16-thread Ryzen"
+ },
+ {
+  "name": "workers12",
+  "suite": "quick",
+  "runs": 3,
+  "set": [
+   "--pool-workers=12"
+  ],
+  "compare": "tuning/results/base"
+ },
+ {
+  "name": "reserve1024",
+  "suite": "full",
+  "runs": 3,
+  "set": [
+   "--vram-reserve-mib=1024"
+  ],
+  "compare": "tuning/results/base",
+  "note": "VRAM left free for Windows and other programs; a 12 GB card may want more"
+ },
+ {
+  "name": "reserve2048",
+  "suite": "full",
+  "runs": 3,
+  "set": [
+   "--vram-reserve-mib=2048"
+  ],
+  "compare": "tuning/results/base"
+ },
+ {
+  "name": "adapt-bg",
+  "suite": "full",
+  "runs": 3,
+  "env": {
+   "STRATA_ADAPT_BG": "1"
+  },
+  "compare": "tuning/results/base",
+  "note": "background adaptive expert-cache swaps (opt-in; see tuning/LOG.md for the NaN history)"
+ },
+ {
+  "name": "pin-limit-4",
+  "suite": "quick",
+  "runs": 3,
+  "env": {
+   "STRATA_PIN_LIMIT_GIB": "4"
+  },
+  "compare": "tuning/results/base",
+  "note": "how much host memory is page-locked (default 8 GiB on Windows HIP)"
+ },
+ {
+  "name": "no-mmq",
+  "suite": "prompt",
+  "runs": 3,
+  "env": {
+   "STRATA_PREFILL_MMQ": "0"
+  },
+  "compare": "tuning/results/base",
+  "note": "prompt path without llama.cpp's MMQ kernels"
+ }
+]

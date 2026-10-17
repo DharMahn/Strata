@@ -170,6 +170,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    # the template's own switch for thinking a client sends back: false keeps only the current request's steps
+    keep = (req.get("chat_template_kwargs") or {}).get("preserve_thinking")
+    if isinstance(keep, bool):
+        kwargs["preserve_thinking"] = keep
     return _late_system_to_user(messages), tools, kwargs
 
 

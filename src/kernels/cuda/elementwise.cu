@@ -213,7 +213,7 @@ __global__ void doorbell_ring_kernel(uint32_t* seq) {
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
-    while (*flag != want) strata_spin_pause();
+    STRATA_SPIN_WHILE(*flag != want);
     __threadfence_system();
 }
 
@@ -302,6 +302,23 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     if (n <= 0) return;
     copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
+}
+
+namespace {
+__global__ void read_probe_kernel(const uint4* __restrict__ p, uint64_t n4, uint32_t* sink) {
+    uint32_t acc = 0;
+    for (uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (uint64_t) gridDim.x * blockDim.x) {
+        const uint4 v = p[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x9e3779b9u && sink != nullptr) *sink = acc;   // keeps the loads alive
+}
+}  // namespace
+
+void read_probe(const void* p, uint64_t bytes, uint32_t* sink, void* stream) {
+    if (p == nullptr || bytes < 16) return;
+    read_probe_kernel<<<2048, 256, 0, (cudaStream_t) stream>>>((const uint4*) p, bytes / 16, sink);
+    check_launch("read_probe");
 }
 
 void doorbell_ring(uint32_t* d_seq, void* stream) {

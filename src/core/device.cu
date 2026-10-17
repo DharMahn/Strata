@@ -3,7 +3,9 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::core {
@@ -89,6 +91,38 @@ std::string gpu_arch_problem(int ordinal) {
 #else
     (void) ordinal;
     return "";
+#endif
+}
+
+namespace {
+std::atomic<int> g_primary_gpu{0};
+}
+
+int primary_gpu() { return g_primary_gpu.load(); }
+
+int select_primary_gpu(std::string& err) {
+#if defined(STRATA_USE_HIP)
+    // The HIP shim already numbers only the GPUs this binary can run on (hip_compat/cuda_runtime.h): logical 0 is
+    // the first of them.  With none, logical 0 is HIP's device 0 and the architecture check below says why not.
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
+        cudaGetLastError();
+        err = std::string("no HIP device is present; this engine was compiled for ") + STRATA_HIP_ARCHS;
+        return -1;
+    }
+    if (const std::string why = gpu_arch_problem(0); !why.empty()) {
+        err = why;
+        return -1;
+    }
+    if (cudaSetDevice(0) != cudaSuccess) {
+        err = std::string("cudaSetDevice(0) failed: ") + cudaGetErrorString(cudaGetLastError());
+        return -1;
+    }
+    g_primary_gpu.store(0);
+    return 0;
+#else
+    (void) err;
+    return 0;
 #endif
 }
 

@@ -30,7 +30,9 @@ import ctypes
 import json
 import os
 import queue
+import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -55,6 +57,13 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+THINK_OPEN = "<think>\n"    # the template's generation prompt ends with this when the model thinks
+# how a prompt ends when the model continues after a tool result (the template's tool messages, then the generation
+# prompt): the written thinking opening is only for turns that start from the user's message
+AFTER_TOOL_RESULT = "</tool_response><|im_end|>\n<|im_start|>assistant\n" + THINK_OPEN
+# strata_think_prefix_tool=true: the opening after a tool result - prose, without naming the request (tuning/style)
+TOOL_THINK_PREFIX = "Let me"
+THINK_PREFIX = "Let me think about this. The user"   # strata_think_prefix=true (tuning/style/README.md)
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -551,7 +560,13 @@ def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ)
-    if gpu_list(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (setup's KFD order)
+    if cfg.get("backend") == "hip" and os.name == "nt":
+        # Windows HIP: HIP_VISIBLE_DEVICES cannot hide the CPU's integrated Radeon (an index other than 0 makes the
+        # runtime list no device at all), so the engine numbers only the GPUs it has code for itself (the HIP shim);
+        # the config's "gpu", when there is one, is a HIP ordinal and is passed as STRATA_GPU
+        if gpu_list(cfg):
+            env["STRATA_GPU"] = str(gpu_list(cfg)[0])
+    elif gpu_list(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (setup's KFD order)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
@@ -621,6 +636,7 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
+        self.think_open = list(tokenizer.encode(THINK_OPEN, parse_special=True))   # how a thinking prompt ends
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -756,6 +772,21 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
+    @staticmethod
+    def think_prefix(sampling: dict, key: str = "strata_think_prefix", default: str = THINK_PREFIX) -> str:
+        """`strata_think_prefix` (a request field, or a default from the config's `sampling` block or the shared Chat
+        settings): true = THINK_PREFIX, a string = those words, false/absent = none.  This model has two ways to
+        think, terse notes ("We need answer user ...") and prose ("The user wants ... Let me ..."); its High level's
+        instruction mostly picks the notes, which draw and write worse, and the first words decide the rest
+        (tuning/style/README.md).  Written for it, they keep the long thinking of High in prose: THINK_PREFIX held
+        in 64 of 66 short tests over six kinds of request, "The user" alone in 8 of 18.  After a tool result `run`
+        reads `strata_think_prefix_tool` instead (true = TOOL_THINK_PREFIX): those steps must not restate the
+        request (see `run`)."""
+        v = sampling.get(key)
+        if v is True:
+            return default
+        return v[:200] if isinstance(v, str) else ""
+
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
@@ -886,6 +917,18 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def thinking_kept(self, messages, kwargs):
+        """The template kwargs with the config's `sampling.preserve_thinking`, for a client that sends thinking back
+        (Hermes with reasoning_echo, llama.cpp's page, Anthropic clients).  The template keeps all of it unless told
+        otherwise; false keeps the thinking of the steps after the last user message only - an agent's tool loop
+        still reads its own earlier steps (they keep it in prose, tuning/style/README.md), and a new message drops
+        the previous request's thinking: Hermes's small turns were up to 92% thinking.  The request's own
+        chat_template_kwargs wins.  A request without any thinking in it renders as before."""
+        keep = self.sampling_defaults.get("preserve_thinking")
+        if isinstance(keep, bool) and "preserve_thinking" not in kwargs and                 any(m.get("reasoning_content") for m in messages):
+            kwargs = {**kwargs, "preserve_thinking": keep}
+        return kwargs
+
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
@@ -955,7 +998,7 @@ class Service:
                     s["phase"], s["tool"] = f"writing a tool call: {ev.call.name}", ev.call.name
                 elif ev.kind == "tool_call":
                     s["phase"] = "tool call complete"
-                s["tail"] = (s["tail"] + (ev.text or ""))[-600:]
+                s["tail"] = (s.get("tail", "") + (ev.text or ""))[-600:]
 
     def _progress(self, last_print, every=1.0):
         """A progress line in the server window every `every` seconds while a request runs."""
@@ -977,11 +1020,32 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+        asked = dict(sampling or {})                    # the request as the client sent it (STRATA_REQUEST_LOG)
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        # strata_think_prefix: the first words of the thinking are written for the model (tuning/style/README.md)
+        prefix = ""
+        if thinking and list(ids[-len(self.think_open):]) == self.think_open:   # the prompt ends in an open <think>
+            if self.tok.decode(list(ids[-len(AFTER_TOOL_RESULT):])).endswith(AFTER_TOOL_RESULT):
+                # mid-task, after a tool result: "The user ..." made the model restate the request it was working on,
+                # and in a long agent session (the request 20K+ tokens back, the earlier thinking stripped) it
+                # restated benchmark requests nobody made (tuning/style/README.md).  These steps get their own
+                # opening (strata_think_prefix_tool), which does not name the request - or none.  Without one, 6 of
+                # 18 such steps of a Hermes run were clipped notes, among them the ones that rewrote its drawing
+                # (tuning/style/hermes_replay.py).  The main switch turned off turns this one off too, unless the
+                # request sets it itself.
+                if sampling.get("strata_think_prefix") is not False or asked.get("strata_think_prefix_tool") is not None:
+                    prefix = self.think_prefix(sampling, "strata_think_prefix_tool", TOOL_THINK_PREFIX)
+            else:
+                prefix = self.think_prefix(sampling)
+        pre_events = []
+        if prefix:
+            ids = list(ids) + self.tok.encode(prefix)
+            max_new = min(max_new, max(1, self.engine.max_context - CTX_SLACK - len(ids)))
+            pre_events = parser.feed(prefix)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -991,10 +1055,16 @@ class Service:
         engine_last0 = getattr(self.engine, "last", None)
         with self.status_lock:
             self.status["queued"] += 1
+        queued = True
         try:
-            with self.fifo:
+            # waiting for its turn, a ping every second: a streamed client gets its keep-alives, and the handler can
+            # see that the client has left - then this request never starts
+            while not self.fifo.acquire(timeout=1.0):
+                yield "ping", None
+            try:
                 with self.status_lock:
                     self.status["queued"] -= 1
+                    queued = False
                 # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                 self.ensure_loaded()
                 with self.status_lock:
@@ -1007,6 +1077,8 @@ class Service:
                 gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
                     self.engine.generate(ids, max_new, sampling, cancel)
                 try:
+                    for ev in pre_events:               # the written-for-it start of the thinking, shown as such
+                        yield "event", ev
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
@@ -1040,54 +1112,68 @@ class Service:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
                     #                                     fifo, so a stop-token break can't leave the shared engine
                     #                                     queue mid-drain for the next request to read as its own DONE
-        except GeneratorExit:                           # the client disconnected mid-stream
+            except GeneratorExit:                       # the client disconnected mid-stream
+                finish = "disconnect"
+                raise
+            finally:
+                # this request's figures and the status, cleared while it still holds its turn: done after the
+                # release, the next request had already written its own status - which then lost its "tail" (a
+                # KeyError in _note) and was reported as "done ... in 0 s" (two Hermes image calls at once)
+                with self.status_lock:
+                    if self.status.get("busy"):
+                        # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
+                        last = dict(getattr(self.engine, "last", {}) or {}) \
+                            if getattr(self.engine, "last", None) is not engine_last0 else {}
+                        started = self.status.get("started", time.time())
+                        loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
+                        hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                        self.history.append({
+                            "projection": (sampling or {}).get("experimental_speed_projection") is not False
+                            if loaded else None,
+                            "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                            "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
+                            "engine_generated": last.get("generated"),
+                            "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                            "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                            if n and last.get("generated") and last.get("decode_ms") else None,
+                            "hit_rate": hit_rate})
+                        t = self.totals
+                        t["requests"] += 1
+                        t["prompt_tokens"] += len(ids)
+                        t["reused"] += last.get("reused") or 0
+                        t["output_tokens"] += n
+                        t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                        t["decode_ms"] += last.get("decode_ms") or 0.0
+                        fresh = getattr(self.engine, "last", None)
+                        if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                            timings = request_timings(len(ids), n, last)
+                            self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                        self.last_request_at = time.time()
+                        now = time.time()
+                        el = now - self.status.get("started", now)
+                        ft = self.status.get("first_token")
+                        rate = n / max(1e-6, now - ft) if ft else 0.0
+                        hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                        print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                              f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                        if os.environ.get("STRATA_DEBUG") and raw_ids:
+                            print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                    self.status["busy"] = False
+                    self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
+                    self.status.pop("tool", None)
+                self.fifo.release()
+        except GeneratorExit:                           # the client left while this request waited for its turn
             finish = "disconnect"
             raise
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-            with self.status_lock:
-                if self.status.get("busy"):
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
-                    last = dict(getattr(self.engine, "last", {}) or {}) \
-                        if getattr(self.engine, "last", None) is not engine_last0 else {}
-                    started = self.status.get("started", time.time())
-                    loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
-                    hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                    self.history.append({
-                        "projection": (sampling or {}).get("experimental_speed_projection") is not False
-                        if loaded else None,
-                        "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
-                        "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
-                        "engine_generated": last.get("generated"),
-                        "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
-                        "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                        if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
-                    t = self.totals
-                    t["requests"] += 1
-                    t["prompt_tokens"] += len(ids)
-                    t["reused"] += last.get("reused") or 0
-                    t["output_tokens"] += n
-                    t["prompt_ms"] += last.get("prompt_ms") or 0.0
-                    t["decode_ms"] += last.get("decode_ms") or 0.0
-                    fresh = getattr(self.engine, "last", None)
-                    if fresh is not None and fresh is not before:      # the engine's clock for THIS request
-                        timings = request_timings(len(ids), n, last)
-                        self.last_timings = dict(timings, at=int(time.time())) if timings else None
-                    self.last_request_at = time.time()
-                    now = time.time()
-                    el = now - self.status.get("started", now)
-                    ft = self.status.get("first_token")
-                    rate = n / max(1e-6, now - ft) if ft else 0.0
-                    hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                    print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                          f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                    if os.environ.get("STRATA_DEBUG") and raw_ids:
-                        print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
-                self.status["busy"] = False
-                self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
-                self.status.pop("tool", None)
+            if queued:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+            if os.environ.get("STRATA_REQUEST_LOG"):
+                log_request(os.environ["STRATA_REQUEST_LOG"], self.tok, asked, sampling, ids, raw_ids, thinking,
+                            finish, n, prefix)
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -1112,6 +1198,36 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def log_request(path, tok, asked, sampling, ids, raw_ids, thinking, finish, n, prefix=""):
+    """STRATA_REQUEST_LOG=<file>: one JSON line per request - what the client sent, what the engine was told and
+    read, and how the reply began - to compare clients (the web app, llama.cpp's page, API tools) on one server.
+    `thinking_style`: the two ways this model opens its thinking ("We need ..." clipped, "The user ..." prose)."""
+    try:
+        prompt = tok.decode(list(ids))
+        raw = prefix + (tok.decode(raw_ids) if raw_ids else "")
+        th, sep, answer = raw.partition("</think>") if thinking else ("", "", raw)
+        if thinking and not sep:                        # stopped while still thinking
+            th, answer = raw, ""
+        th, answer = th.strip(), answer.strip()
+        style = ("clipped" if th.startswith(("We ", "Need", "User ")) else
+                 "prose" if th.startswith(("The user", "Let me", "Okay", "Alright", "I ")) else "other" if th else "none")
+        client = ("llama.cpp-style page" if "return_progress" in asked or "timings_per_token" in asked else
+                  "Strata web app" if "strata_mcp" in asked or "experimental_speed_projection" in asked else "other")
+        tools = [(t.get("function") or t).get("name") for t in asked.get("tools") or [] if isinstance(t, dict)]
+        rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "client_guess": client, "finish": finish,
+               "fields": {k: v for k, v in asked.items() if k not in ("messages", "tools")},
+               "messages": [{"role": m.get("role"), "content": str(m.get("content"))[:400]}
+                            for m in asked.get("messages") or [] if isinstance(m, dict)],
+               "tools": tools, "engine_keys": StrataEngine.sampling_keys(sampling or {}).strip(),
+               "prompt_tokens": len(ids), "prompt_head": prompt[:2500], "prompt_tail": prompt[-600:],
+               "think_prefix": prefix, "output_tokens": n, "thinking_style": style, "thinking_chars": len(th),
+               "thinking_head": th[:600], "answer_chars": len(answer), "answer_head": answer[:400]}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:  # noqa: BLE001 - a debug log must never break a request
+        print(f"[strata] request log: {e}", flush=True)
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -1466,7 +1582,10 @@ def make_handler(svc: Service):
                 return
             if path == "/settings":
                 if self._authorized():
-                    self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
+                    self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared,
+                                     # what the run config's `sampling` block sets (the web app's switch follows it)
+                                     "server_defaults": {"strata_think_prefix":
+                                                         bool(svc.sampling_defaults.get("strata_think_prefix"))}})
                 return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
@@ -1618,9 +1737,35 @@ def make_handler(svc: Service):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
+        def _client_gone(self) -> bool:
+            """The client closed its connection: the socket is readable and has nothing to read."""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+            except (OSError, ValueError):
+                return True
+
+        def _while_connected(self, items, cancel):
+            """A non-streamed request's chunks while its client is still there.  Nothing is written before the end,
+            so a client that gave up went unnoticed and the engine finished a reply for nobody: Hermes's image
+            calls time out after 120 s, and one of them then thought for 15 minutes with the agent's next step
+            waiting behind it.  Looked at once a second (the queue and the engine send pings while they are quiet)."""
+            checked = time.time()
+            for item in items:
+                if time.time() - checked >= 1.0:
+                    checked = time.time()
+                    if self._client_gone():
+                        print("[strata] the client of a non-streamed request has left: stopping it", flush=True)
+                        cancel.set()
+                        items.close()
+                        self.close_connection = True
+                        raise ConnectionAbortedError("the client left")   # no reply, and no stack trace (handle_error)
+                yield item
+
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
+            kw = svc.thinking_kept(messages, kw)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -1638,7 +1783,7 @@ def make_handler(svc: Service):
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._json(200, openai_collect(self._while_connected(chunks, cancel)))
             self._sse()
             try:
                 for c in chunks:
@@ -1661,13 +1806,14 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req)
+            kw = svc.thinking_kept(messages, kw)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                return self._json(200, anthropic_collect(self._while_connected(events, cancel)))
             self._sse()
             try:
                 for item in events:
@@ -1747,7 +1893,8 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
-SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection",
+               "strata_think_prefix")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -1781,6 +1928,9 @@ def clean_shared_defaults(d) -> dict:
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise ValueError("experimental_speed_projection: true or false")
+        elif key == "strata_think_prefix":
+            if not isinstance(value, bool):
+                raise ValueError("strata_think_prefix: true or false")
         else:
             raise ValueError(f"unknown setting {key!r}")
         out[key] = float(value) if key in ("temperature", "top_p") else value
@@ -1790,8 +1940,9 @@ def clean_shared_defaults(d) -> dict:
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
-    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
-    always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
+    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed, experimental_speed_projection,
+    strata_think_prefix, strata_think_prefix_tool, preserve_thinking (`Service.thinking_kept`).  The request's own
+    fields always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
@@ -1839,6 +1990,16 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             if not isinstance(value, bool):
                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
+            out[key] = value
+        elif key == "preserve_thinking":
+            if not isinstance(value, bool):
+                raise SystemExit(f"[strata] config sampling.preserve_thinking={value!r}: expected true or false "
+                                 "(false: thinking a client sends back is kept for the current request's steps only)")
+            out[key] = value
+        elif key in ("strata_think_prefix", "strata_think_prefix_tool"):
+            if not isinstance(value, (bool, str)) or (isinstance(value, str) and not value.strip()):
+                raise SystemExit(f"[strata] config sampling.{key}={value!r}: expected true, false or the "
+                                 "words the thinking starts with")
             out[key] = value
         else:
             print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)

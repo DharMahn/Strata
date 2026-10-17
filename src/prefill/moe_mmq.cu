@@ -29,6 +29,26 @@ __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uin
     else if (i < na + nb) ab_dst[i] = b[i - na];
     else if (i < na + nb + nc) c_dst[i - na - nb] = c[i - na - nb];
 }
+// blockIdx.y: the expert; its gate and up halves, then its down, as 16-byte pieces (bytes when not aligned)
+template <bool A16>
+__global__ void gather_batch_kernel(GatherBatch b, int64_t gu_half, int64_t d, uint8_t* __restrict__ gu_dst,
+                                    int64_t gu_stride, uint8_t* __restrict__ d_dst, int64_t d_stride) {
+    const GatherSrc s = b.e[blockIdx.y];
+    constexpr int64_t U = A16 ? 16 : 1;
+    const int64_t na = gu_half / U, nc = d / U;
+    uint8_t* gu = gu_dst + (int64_t) s.slot * gu_stride;
+    uint8_t* dn = d_dst + (int64_t) s.slot * d_stride;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < 2 * na + nc; i += (int64_t) gridDim.x * blockDim.x) {
+        const uint8_t* src;
+        uint8_t* dst;
+        if (i < na) { src = (const uint8_t*) s.gate + i * U; dst = gu + i * U; }
+        else if (i < 2 * na) { src = (const uint8_t*) s.up + (i - na) * U; dst = gu + i * U; }
+        else { src = (const uint8_t*) s.down + (i - 2 * na) * U; dst = dn + (i - 2 * na) * U; }
+        if constexpr (A16) *(uint4*) dst = *(const uint4*) src;
+        else *dst = *src;
+    }
+}
+
 __global__ void copy1_kernel(const uint8_t* __restrict__ a, int64_t na, const uint8_t* __restrict__ b, int64_t nb,
                              uint8_t* __restrict__ ab_dst, const uint8_t* __restrict__ c, int64_t nc, uint8_t* __restrict__ c_dst) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -83,6 +103,57 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
+__global__ void bounds_kernel(int32_t* b, int32_t rows) {
+    b[0] = 0;
+    b[1] = rows;
+}
+
+// quantize.cu's quantize_mmq_q8_1 for FP16 rows (one channel, no id map): the same blocks, the same rounding
+template <mmq_q8_1_ds_layout ds_layout>
+__global__ void quantize_h_kernel(const uint16_t* __restrict__ x, block_q8_1_mmq* __restrict__ y, int64_t ne00,
+                                  int64_t ld, int64_t ne0, int64_t rows) {
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+    const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= ne0) return;
+    const int64_t row = blockIdx.x;
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 < ne00) {
+        const uint2 raw = *(const uint2*) (x + row * ld + i0);
+        const float2 a = __half22float2(*(const half2*) &raw.x), b = __half22float2(*(const half2*) &raw.y);
+        xi = make_float4(a.x, a.y, b.x, b.y);
+    }
+    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+#pragma unroll
+    for (int offset = vals_per_scale / 8; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    float sum = 0.0f;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = vals_per_sum / 8; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+    }
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x * d_inv);
+    q.y = roundf(xi.y * d_inv);
+    q.z = roundf(xi.z * d_inv);
+    q.w = roundf(xi.w * d_inv);
+    const float d = 1.0f / d_inv;
+    const int64_t iqs = i0 % QK8_1_MMQ, ib = (i0 / QK8_1_MMQ) * rows + row;
+    ((char4*) y[ib].qs)[iqs / 4] = q;
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs / 16] = sum;
+            if (iqs % 64 == 0) y[ib].d2s6[iqs / 64] = d;
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) y[ib].ds4[iqs / 32] = make_half2(d, sum);
+        else y[ib].d4[iqs / 32] = d;
+    }
+}
+
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
@@ -94,6 +165,7 @@ bool supported(int t) {
         case GGML_TYPE_Q2_0: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:   // the GGUF's dense matrices
             return true;
         default:
             return false;
@@ -143,6 +215,9 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
         case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
         case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
@@ -167,6 +242,22 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     ck(cudaGetLastError(), "gather_native");
 }
 
+void gather_native_batch(const GatherBatch& b, int n, size_t gu_half_bytes, size_t d_bytes, void* gu_dst, size_t gu_stride,
+                         void* d_dst, size_t d_stride, void* stream) {
+    if (n <= 0) return;
+    uintptr_t any = (uintptr_t) gu_dst | (uintptr_t) d_dst | gu_half_bytes | d_bytes | gu_stride | d_stride;
+    for (int i = 0; i < n; ++i) any |= (uintptr_t) b.e[i].gate | (uintptr_t) b.e[i].up | (uintptr_t) b.e[i].down;
+    const cudaStream_t s = (cudaStream_t) stream;
+    const dim3 grid(40, (unsigned) n);   // ~1.7 MB per expert: 40 blocks x 256 threads each
+    if (any % 16 == 0)
+        gather_batch_kernel<true><<<grid, 256, 0, s>>>(b, (int64_t) gu_half_bytes, (int64_t) d_bytes, (uint8_t*) gu_dst,
+                                                       (int64_t) gu_stride, (uint8_t*) d_dst, (int64_t) d_stride);
+    else
+        gather_batch_kernel<false><<<grid, 256, 0, s>>>(b, (int64_t) gu_half_bytes, (int64_t) d_bytes, (uint8_t*) gu_dst,
+                                                        (int64_t) gu_stride, (uint8_t*) d_dst, (int64_t) d_stride);
+    ck(cudaGetLastError(), "gather_native_batch");
+}
+
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
     strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
@@ -183,6 +274,26 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     if (n <= 0) return;
     iota_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(dst, n);
     ck(cudaGetLastError(), "iota");
+}
+
+void quantize_h(const uint16_t* x, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    if (rows <= 0) return;
+    const int64_t ne0 = pad512(cols);
+    const dim3 grid((unsigned) rows, (unsigned) ((ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ)), 1);
+    const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const cudaStream_t s = (cudaStream_t) stream;
+    auto* y = (block_q8_1_mmq*) xq;
+    switch (mmq_get_q8_1_ds_layout((ggml_type) t)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4: quantize_h_kernel<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, block, 0, s>>>(x, y, cols, ld, ne0, rows); break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4: quantize_h_kernel<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, block, 0, s>>>(x, y, cols, ld, ne0, rows); break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6: quantize_h_kernel<MMQ_Q8_1_DS_LAYOUT_D2S6><<<grid, block, 0, s>>>(x, y, cols, ld, ne0, rows); break;
+    }
+    ck(cudaGetLastError(), "quantize_h");
+}
+
+void dense_bounds(int32_t* b, int64_t rows, void* stream) {
+    bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(b, (int32_t) rows);
+    ck(cudaGetLastError(), "dense_bounds");
 }
 
 }  // namespace strata::prefill::mmq

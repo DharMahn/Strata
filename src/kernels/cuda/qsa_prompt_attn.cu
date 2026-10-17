@@ -672,6 +672,268 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
     return true;
 }
 
+// ---- RDNA2 (no matrix cores, so neither kernel above runs there): the same per-query walk in FP32 FMAs, register
+// tiled.  One block of 256 threads per (query, KV head) walks the query's selected cells in chunks of 32 with an
+// online softmax.  q.k: wave w takes cells 4w..4w+3 of all 12 heads over all 256 dims, each
+// lane 4 dims of every 32 for a 3-head x 4-cell tile of its wave's 4 cells, per int8 group scaled by the cells' K
+// scales, then summed over the wave's 8 lanes of that tile.  The next chunk's K/V loads are in flight while a chunk
+// computes.  p.v: each lane a 3-head x 4-dim tile, the V scale folded into p per 64-dim group.  The codes are kept biased by 128
+// (one v_cvt_f32_ubyte per value) and the bias is taken out of each partial with the slice's sum of q (or the
+// chunk's sum of p).  FP32 throughout: the decode kernel's arithmetic in another summation order.
+// STRATA_PROMPT_ATTN_RDNA=0: the decode kernel (the A/B).
+#if defined(__HIPCC__)
+namespace rdna {
+constexpr int CH = 32, THREADS = 256, KROW = HD + 16, QROW = HD + 4;
+struct Smem {
+    float q[G][QROW];           // q times log2(e) / sqrt(256)
+    float qg[4][G];             // per int8 scale group: 128 x the sum of q (the codes' bias)
+    uint8_t k[CH][KROW];        // codes + 128
+    uint8_t v[CH][KROW];
+    float ks[CH][4], vs[CH][4];
+    float s[G][CH + 1];
+    float pg[4][G][CH];         // p times the V scale of group g
+    float pgsum[4][G];          // the V bias: the chunk's sum of pg
+    float alpha[G], lsum[G], mrow[G];
+    long long row[2][CH];       // this chunk's pool rows and the next one's (-1: masked)
+};
+
+__device__ __forceinline__ float ub(uint32_t w, int i) { return (float) ((w >> (8 * i)) & 0xffu); }
+
+__device__ __forceinline__ long long pool_row(const QsaAttnPools& p, const int32_t* ids, int i, int n_kv_heads,
+                                              int kvh, int page_size) {
+    const int cell = ids[i];
+    const long long page = (long long) p.page_table[cell / page_size];
+    return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (cell % page_size) : -1;   // -1: not resident
+}
+
+// this thread's share of a chunk: K and V pieces t and t + 256 (cell i >> 4, 16 bytes i & 15), one K and one V scale
+struct Fetch {
+    uint4 k[2], v[2];
+    float ks = 0.0f, vs = 0.0f;
+};
+__device__ __forceinline__ void fetch(const QsaAttnPools& p, const long long* rows, int t, Fetch& f) {
+    const uint4 bias = make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);   // code 0
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int i = t + j * THREADS, c = i >> 4, pc = i & 15;
+        const long long r = rows[c];
+        f.k[j] = f.v[j] = bias;
+        if (r >= 0) {
+            const uint4 kx = *(reinterpret_cast<const uint4*>(p.k_q + r * HD) + pc);
+            const uint4 vx = *(reinterpret_cast<const uint4*>(p.v_q + r * HD) + pc);
+            f.k[j] = make_uint4(kx.x ^ bias.x, kx.y ^ bias.y, kx.z ^ bias.z, kx.w ^ bias.w);
+            f.v[j] = make_uint4(vx.x ^ bias.x, vx.y ^ bias.y, vx.z ^ bias.z, vx.w ^ bias.w);
+        }
+    }
+    f.ks = f.vs = 0.0f;
+    if (t < CH * 4) {
+        const long long r = rows[t >> 2];
+        if (r >= 0) {
+            f.ks = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + (t & 3)]));
+            f.vs = __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + (t & 3)]));
+        }
+    }
+}
+
+__global__ void __launch_bounds__(THREADS) attn_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                       const int32_t* __restrict__ ids,
+                                                       const int32_t* __restrict__ steps, int n_kv_heads,
+                                                       int page_size, float scale_log2, float* __restrict__ attn,
+                                                       int cap) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    Smem& S = *reinterpret_cast<Smem*>(smem_raw);
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = steps[(size_t) qi * kStepCount + kStepWidth];
+    const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    for (int i = t; i < G * HD; i += THREADS) S.q[i / HD][i % HD] = q[i] * scale_log2;
+    if (t < G) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    if (t < CH) S.row[0][t] = t < n ? pool_row(p, ids, t, n_kv_heads, kvh, page_size) : -1;
+    __syncthreads();
+    if (t < 4 * G) {
+        const int g = t / G, h = t % G;
+        float s = 0.0f;
+        for (int d = 64 * g; d < 64 * g + 64; ++d) s += S.q[h][d];
+        S.qg[g][h] = 128.0f * s;
+    }
+    Fetch f;
+    if (n > 0) fetch(p, S.row[0], t, f);
+    // q.k: this wave's cells 4 wave .. 4 wave + 3, heads 3 hs .. 3 hs + 2, dims 4 ds .. 4 ds + 3 of every 32
+    const int hs = lane >> 3, ds = lane & 7, cb = 4 * wave;
+    // p.v: heads 3 hp .. 3 hp + 2, dims d0 .. d0 + 3 (scale group grp)
+    const int hp = wave & 3, d0 = ((wave >> 2) * 32 + lane) * 4, grp = d0 / 64;
+    float acc[3][4];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+
+    int b = 0;
+    for (int c0 = 0; c0 < n; c0 += CH, b ^= 1) {
+        const int nh = min(CH, n - c0);
+        __syncthreads();   // the previous chunk's p.v is done with v and pg
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int i = t + j * THREADS;
+            *reinterpret_cast<uint4*>(&S.k[i >> 4][(i & 15) * 16]) = f.k[j];
+            *reinterpret_cast<uint4*>(&S.v[i >> 4][(i & 15) * 16]) = f.v[j];
+        }
+        if (t < CH * 4) { S.ks[t >> 2][t & 3] = f.ks; S.vs[t >> 2][t & 3] = f.vs; }
+        const bool more = c0 + CH < n;
+        if (more && t < CH) S.row[b ^ 1][t] = c0 + CH + t < n ? pool_row(p, ids, c0 + CH + t, n_kv_heads, kvh, page_size) : -1;
+        __syncthreads();
+        if (more) fetch(p, S.row[b ^ 1], t, f);   // the next chunk's loads fly while this one computes
+        {   // q.k: per int8 group, the lane's dims, scaled by the cells' K scales; then summed over the 8 lanes
+            float sc[3][4];
+#pragma unroll
+            for (int j = 0; j < 3; ++j) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.0f;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                float tg[3][4];
+#pragma unroll
+                for (int j = 0; j < 3; ++j) tg[j][0] = tg[j][1] = tg[j][2] = tg[j][3] = 0.0f;
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int d = 64 * g + 32 * half + 4 * ds;
+                    float4 qv[3];
+#pragma unroll
+                    for (int j = 0; j < 3; ++j) qv[j] = *reinterpret_cast<const float4*>(&S.q[3 * hs + j][d]);
+#pragma unroll
+                    for (int cc = 0; cc < 4; ++cc) {
+                        const uint32_t kw = *reinterpret_cast<const uint32_t*>(&S.k[cb + cc][d]);
+                        const float k0 = ub(kw, 0), k1 = ub(kw, 1), k2 = ub(kw, 2), k3 = ub(kw, 3);
+#pragma unroll
+                        for (int j = 0; j < 3; ++j)
+                            tg[j][cc] = fmaf(qv[j].w, k3, fmaf(qv[j].z, k2, fmaf(qv[j].y, k1, fmaf(qv[j].x, k0, tg[j][cc]))));
+                    }
+                }
+#pragma unroll
+                for (int cc = 0; cc < 4; ++cc) {
+                    const float kscale = S.ks[cb + cc][g];
+#pragma unroll
+                    for (int j = 0; j < 3; ++j) sc[j][cc] = fmaf(tg[j][cc], kscale, sc[j][cc]);
+                }
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1)
+#pragma unroll
+                for (int j = 0; j < 3; ++j)
+#pragma unroll
+                    for (int cc = 0; cc < 4; ++cc) sc[j][cc] += __shfl_xor_sync(0xffffffffu, sc[j][cc], o);
+            if (ds == 0) {
+#pragma unroll
+                for (int j = 0; j < 3; ++j)
+#pragma unroll
+                    for (int cc = 0; cc < 4; ++cc) {
+                        const int h = 3 * hs + j, c = cb + cc;
+                        float bias = 0.0f;
+#pragma unroll
+                        for (int g = 0; g < 4; ++g) bias = fmaf(S.ks[c][g], S.qg[g][h], bias);
+                        S.s[h][c] = sc[j][cc] - bias;
+                    }
+            }
+        }
+        __syncthreads();
+        // the online softmax: wave w takes heads w and w + 8, a lane per cell
+        for (int h = wave; h < G; h += 8) {
+            const float s = S.s[h][lane];
+            const bool live = lane < nh && S.row[b][lane] >= 0;
+            float mx = live ? s : -INFINITY;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[h], m_new = fmaxf(m_old, mx);
+            const float e = live ? exp2f(s - m_new) : 0.0f;
+            float sum = e, gs[4];
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                gs[g] = e * S.vs[lane][g];
+                S.pg[g][h][lane] = gs[g];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+#pragma unroll
+                for (int g = 0; g < 4; ++g) gs[g] += __shfl_xor_sync(0xffffffffu, gs[g], o);
+            }
+            if (lane == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[h] = a;
+                S.lsum[h] = fmaf(S.lsum[h], a, sum);
+                S.mrow[h] = m_new;
+#pragma unroll
+                for (int g = 0; g < 4; ++g) S.pgsum[g][h] = gs[g];
+            }
+        }
+        __syncthreads();
+        {   // p.v
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                const float a = S.alpha[3 * hp + j], bias = 128.0f * S.pgsum[grp][3 * hp + j];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[j][i] = fmaf(acc[j][i], a, -bias);
+            }
+#pragma unroll 2
+            for (int c = 0; c < CH; c += 4) {
+                float4 pv[3];
+#pragma unroll
+                for (int j = 0; j < 3; ++j) pv[j] = *reinterpret_cast<const float4*>(&S.pg[grp][3 * hp + j][c]);
+#pragma unroll
+                for (int cc = 0; cc < 4; ++cc) {
+                    const uint32_t vw = *reinterpret_cast<const uint32_t*>(&S.v[c + cc][d0]);
+                    const float v0 = ub(vw, 0), v1 = ub(vw, 1), v2 = ub(vw, 2), v3 = ub(vw, 3);
+#pragma unroll
+                    for (int j = 0; j < 3; ++j) {
+                        const float pj = cc == 0 ? pv[j].x : cc == 1 ? pv[j].y : cc == 2 ? pv[j].z : pv[j].w;
+                        acc[j][0] = fmaf(pj, v0, acc[j][0]);
+                        acc[j][1] = fmaf(pj, v1, acc[j][1]);
+                        acc[j][2] = fmaf(pj, v2, acc[j][2]);
+                        acc[j][3] = fmaf(pj, v3, acc[j][3]);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const float l = S.lsum[3 * hp + j], inv = l > 0.0f ? 1.0f / l : 0.0f;
+        *reinterpret_cast<float4*>(attn + (size_t) (3 * hp + j) * HD + d0) =
+            make_float4(acc[j][0] * inv, acc[j][1] * inv, acc[j][2] * inv, acc[j][3] * inv);
+    }
+}
+
+bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+            const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PROMPT_ATTN_RDNA");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!on || pools.k_q == nullptr || pools.v_q == nullptr || pools.k_q4 != nullptr || pools.v_q4 != nullptr ||
+        !pools.k_scale || !pools.v_scale || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 ||
+        !ids || !steps || !pools.page_table)
+        return false;
+    const int bytes = (int) sizeof(Smem);
+    static bool attr = false;
+    if (!attr) {
+        if (cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        attr = true;
+    }
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        attn_kernel<<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+}  // namespace rdna
+#endif
+
 }  // namespace
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
@@ -692,7 +954,9 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         if (cc_major[dev] < 8) return false;
     }
 #if defined(__HIPCC__)
-    return false;   // the tensor-core kernel is compiled out on AMD (its major version is not a CUDA sm)
+    // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm): the FP32 one above for
+    // int8 KV, else the decode kernel
+    return rdna::launch(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
 #endif
     if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids ||
         !steps || !pools.page_table)

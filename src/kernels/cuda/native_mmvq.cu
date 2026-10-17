@@ -418,6 +418,18 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
 
 __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
     const uint32_t* table32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
+#if defined(__HIP_PLATFORM_AMD__) && __has_builtin(__builtin_amdgcn_perm)
+    // llama.cpp's HIP form (vecdotq.cuh get_int_from_table_16): each nibble's low 3 bits pick a byte of the table's
+    // low or high half (one v_perm_b32 each), its top bit picks the half.  The same byte lookup as below, so the
+    // result is bit-identical: x = the low nibbles' values, y = the high nibbles'.
+    const uint32_t qe = (uint32_t) q4, qo = (uint32_t) q4 >> 4;
+    const uint32_t el = __builtin_amdgcn_perm(table32[1], table32[0], qe & 0x07070707u);
+    const uint32_t ol = __builtin_amdgcn_perm(table32[1], table32[0], qo & 0x07070707u);
+    const uint32_t eh = __builtin_amdgcn_perm(table32[3], table32[2], qe & 0x07070707u);
+    const uint32_t oh = __builtin_amdgcn_perm(table32[3], table32[2], qo & 0x07070707u);
+    return make_int2((int) __builtin_amdgcn_perm(eh, el, 0x03020100u | ((qe & 0x08080808u) >> 1)),
+                     (int) __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((qo & 0x08080808u) >> 1)));
+#endif
     uint32_t tmp[2];
     const uint32_t low_high_selection_indices = 0x32103210 | ((q4 & 0x88888888) >> 1);
 #pragma unroll

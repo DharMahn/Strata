@@ -1,6 +1,8 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -105,6 +107,13 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+    if (static const bool dbg = std::getenv("STRATA_DBG_ARENA") != nullptr; dbg) {   // debug (the "!!!" hunt)
+        static int left = 60;
+        if (left > 0) {
+            --left;
+            std::fprintf(stderr, "strata dbg: snapshot transfer: dst %p src %p, %zu B\n", (void*) dst, (const void*) src, (size_t) n);
+        }
+    }
     // Default handles both device allocations and device-mapped host pool aliases.
     const cudaError_t e = cudaMemcpy(dst, src, n, cudaMemcpyDefault);
     if (e == cudaSuccess) return true;

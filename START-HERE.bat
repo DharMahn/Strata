@@ -1,6 +1,7 @@
 @echo off
 rem Strata for Windows: the first run installs everything and starts the model; later runs just start it.
-rem Needs only an NVIDIA driver. Python is installed for your user account if it is missing (no admin needed).
+rem Needs only a GPU driver (NVIDIA RTX, or - experimental - an AMD RX 6800/6900/7900/9070, see docs/AMD_HIP.md).
+rem Python is installed for your user account if it is missing (no admin needed).
 setlocal
 title Strata
 cd /d "%~dp0"
